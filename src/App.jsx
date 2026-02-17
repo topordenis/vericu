@@ -375,6 +375,28 @@ function App() {
     setViewingTable(table)
   }
 
+  const handleCopyWholeTable = useCallback((table) => {
+    const fileMap = { A: fileDataA, B: fileDataB, C: fileDataC }
+    const sourceKey = compareMode === 'diff' ? 'A' : compareMode
+    const sourceData = fileMap[sourceKey]
+    if (!sourceData) return
+
+    const size = TYPE_SIZES_MAP[table.dataType]
+    const totalBytes = table.rows * table.cols * size
+    const bytes = new Uint8Array(totalBytes)
+
+    for (let i = 0; i < totalBytes; i++) {
+      bytes[i] = sourceData[table.offset + i] ?? 0
+    }
+
+    setClipboard({
+      tableId: table.id,
+      sourceFile: sourceKey,
+      selection: { startRow: 0, startCol: 0, endRow: table.rows - 1, endCol: table.cols - 1 },
+      bytes,
+    })
+  }, [fileDataA, fileDataB, fileDataC, compareMode])
+
   const handleOpenFileA = async () => {
     if (fsApiSupported) {
       try {
@@ -966,6 +988,7 @@ function App() {
                         setSelectedTableId(null)
                         hexViewerRef.current?.goToOffset(offset)
                       }}
+                      onCopyTable={handleCopyWholeTable}
                     />
                   </div>
                 )}

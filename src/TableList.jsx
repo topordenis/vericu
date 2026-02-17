@@ -1,4 +1,4 @@
-function TableList({ tables, onSelect, onEdit, onDelete, selectedId }) {
+function TableList({ tables, onSelect, onEdit, onDelete, onGoToOffset, selectedId, onCopyTable }) {
   if (tables.length === 0) {
     return (
       <div className="p-3 text-gray-500 text-sm text-center">
@@ -22,6 +22,34 @@ function TableList({ tables, onSelect, onEdit, onDelete, selectedId }) {
               {table.name}
             </span>
             <div className="flex gap-1 shrink-0">
+              {onGoToOffset && (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    onGoToOffset(table.offset)
+                  }}
+                  className="text-gray-500 hover:text-blue-400 p-1"
+                  title="Go to offset"
+                >
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 9l3 3m0 0l-3 3m3-3H8m13 0a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                </button>
+              )}
+              {onCopyTable && (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    onCopyTable(table)
+                  }}
+                  className="text-gray-500 hover:text-green-400 p-1"
+                  title="Copy entire table to clipboard"
+                >
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                  </svg>
+                </button>
+              )}
               <button
                 onClick={(e) => {
                   e.stopPropagation()
@@ -52,6 +80,11 @@ function TableList({ tables, onSelect, onEdit, onDelete, selectedId }) {
             <span>{table.rows}x{table.cols}</span>
             <span className="font-mono">{table.dataType.toUpperCase()}</span>
             <span className="font-mono">0x{table.offset.toString(16).toUpperCase()}</span>
+            {(table.xAxis || table.yAxis || table.xAxisTableId || table.yAxisTableId) && (
+              <span className="text-cyan-500" title={table.xAxisTableId || table.yAxisTableId ? "Has linked axis references" : "Has axis labels"}>
+                {table.xAxisTableId || table.yAxisTableId ? '🔗' : '📊'}
+              </span>
+            )}
           </div>
         </div>
       ))}

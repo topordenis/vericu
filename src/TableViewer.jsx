@@ -980,36 +980,57 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
         </div>
 
         {/* Selection info bar */}
-        {selectionStart && selectionEnd && (
+        {(selectionStart && selectionEnd || canPaste) && (
           <div className="fixed bottom-4 left-1/2 -translate-x-1/2 bg-gray-800 border border-gray-600 rounded-lg px-3 py-1.5 shadow-xl flex items-center gap-3 text-sm z-50">
-            <span className="text-gray-400">
-              {(() => {
-                const bounds = getSelectionBounds()
-                if (!bounds) return ''
-                const rows = bounds.maxRow - bounds.minRow + 1
-                const cols = bounds.maxCol - bounds.minCol + 1
-                return `${rows}×${cols} cells`
-              })()}
-            </span>
-            <button
-              onClick={copySelection}
-              className="bg-blue-600 hover:bg-blue-500 text-white px-2 py-0.5 rounded text-xs flex items-center gap-1"
-            >
-              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-              </svg>
-              Copy
-            </button>
-            <span className="text-gray-600 text-xs">Ctrl+C</span>
-            <button
-              onClick={() => { setSelectionStart(null); setSelectionEnd(null) }}
-              className="text-gray-500 hover:text-gray-300"
-              title="Clear selection (Esc)"
-            >
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-              </svg>
-            </button>
+            {selectionStart && selectionEnd && (
+              <>
+                <span className="text-gray-400">
+                  {(() => {
+                    const bounds = getSelectionBounds()
+                    if (!bounds) return ''
+                    const rows = bounds.maxRow - bounds.minRow + 1
+                    const cols = bounds.maxCol - bounds.minCol + 1
+                    return `${rows}×${cols} cells`
+                  })()}
+                </span>
+                <button
+                  onClick={copySelection}
+                  className="bg-blue-600 hover:bg-blue-500 text-white px-2 py-0.5 rounded text-xs flex items-center gap-1"
+                >
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                  </svg>
+                  Copy
+                </button>
+                <span className="text-gray-600 text-xs">Ctrl+C</span>
+              </>
+            )}
+            {canPaste && (
+              <>
+                {selectionStart && selectionEnd && <div className="w-px h-4 bg-gray-600" />}
+                <button
+                  onClick={pasteSelection}
+                  className="bg-green-600 hover:bg-green-500 text-white px-2 py-0.5 rounded text-xs flex items-center gap-1"
+                >
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+                  </svg>
+                  Paste from {clipboard.sourceFile}
+                </button>
+                <span className="text-gray-600 text-xs">Ctrl+V</span>
+              </>
+            )}
+            {selectionStart && selectionEnd && (
+              <button
+                onClick={() => { setSelectionStart(null); setSelectionEnd(null) }}
+                className="text-gray-500 hover:text-gray-300"
+                title="Clear selection (Esc)"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            )}
           </div>
         )}
 
@@ -1063,6 +1084,18 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
               <span className="text-gray-400">⎘</span>
               Copy
             </button>
+            {canPaste && (
+              <button
+                onClick={() => {
+                  pasteSelection()
+                  setContextMenu(null)
+                }}
+                className="w-full px-3 py-1.5 text-left text-sm text-gray-200 hover:bg-gray-700 flex items-center gap-2"
+              >
+                <span className="text-green-400">📋</span>
+                Paste from File {clipboard.sourceFile}
+              </button>
+            )}
           </div>
         )}
 
