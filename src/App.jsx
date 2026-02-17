@@ -7,6 +7,8 @@ import DiffList from './DiffList'
 import SearchPanel from './SearchPanel'
 import MapFinder from './MapFinder'
 import RevLimitFinder from './RevLimitFinder'
+import ChecksumCalculator from './ChecksumCalculator'
+import MapSensorFinder from './MapSensorFinder'
 import {
   isFileSystemAccessSupported,
   openFile,
@@ -17,6 +19,76 @@ import {
 } from './fileSystem'
 
 const STORAGE_KEY = 'webols-project'
+const TYPE_SIZES_MAP = { u8: 1, i8: 1, u16: 2, i16: 2, u32: 4, i32: 4 }
+
+function ExportDropdown({ fileDataA, fileDataB, fileDataC, fileNameA, fileNameB, fileNameC, onDownload }) {
+  const [isOpen, setIsOpen] = useState(false)
+  const dropdownRef = useRef(null)
+
+  useEffect(() => {
+    const handleClickOutside = (e) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target)) {
+        setIsOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside)
+    return () => document.removeEventListener('mousedown', handleClickOutside)
+  }, [])
+
+  return (
+    <div className="relative" ref={dropdownRef}>
+      <button
+        onClick={() => setIsOpen(!isOpen)}
+        className="px-3 py-1 rounded text-sm bg-green-700 hover:bg-green-600 text-white transition-colors flex items-center gap-1"
+      >
+        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+        </svg>
+        Export
+      </button>
+      {isOpen && (
+        <div className="absolute top-full left-0 mt-1 bg-gray-800 border border-gray-600 rounded-lg shadow-xl z-50 py-1 min-w-[140px]">
+          {fileDataA && (
+            <button
+              onClick={() => {
+                onDownload(fileDataA, fileNameA)
+                setIsOpen(false)
+              }}
+              className="w-full px-3 py-1.5 text-left text-sm text-blue-300 hover:bg-gray-700 flex items-center gap-2"
+            >
+              <span className="w-4 h-4 rounded bg-blue-600 text-xs flex items-center justify-center text-white">A</span>
+              {fileNameA || 'File A'}
+            </button>
+          )}
+          {fileDataB && (
+            <button
+              onClick={() => {
+                onDownload(fileDataB, fileNameB)
+                setIsOpen(false)
+              }}
+              className="w-full px-3 py-1.5 text-left text-sm text-green-300 hover:bg-gray-700 flex items-center gap-2"
+            >
+              <span className="w-4 h-4 rounded bg-green-600 text-xs flex items-center justify-center text-white">B</span>
+              {fileNameB || 'File B'}
+            </button>
+          )}
+          {fileDataC && (
+            <button
+              onClick={() => {
+                onDownload(fileDataC, fileNameC)
+                setIsOpen(false)
+              }}
+              className="w-full px-3 py-1.5 text-left text-sm text-orange-300 hover:bg-gray-700 flex items-center gap-2"
+            >
+              <span className="w-4 h-4 rounded bg-orange-600 text-xs flex items-center justify-center text-white">C</span>
+              {fileNameC || 'File C'}
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
 
 function App() {
   const fileInputRefA = useRef(null)
@@ -50,6 +122,9 @@ function App() {
 
   const [viewMode, setViewMode] = useState('hex')
   const [endianness, setEndianness] = useState('little') // 'little' or 'big'
+  const [heatmapEnabled, setHeatmapEnabled] = useState(false)
+  const [formula, setFormula] = useState('') // e.g., "x * 0.375 - 23.625"
+  const [showFormulaInput, setShowFormulaInput] = useState(false)
 
   // Table system state
   const [tables, setTables] = useState([])
@@ -57,6 +132,7 @@ function App() {
   const [editingTable, setEditingTable] = useState(null)
   const [selectedTableId, setSelectedTableId] = useState(null)
   const [viewingTable, setViewingTable] = useState(null)
+  const [clipboard, setClipboard] = useState(null) // { tableId, sourceFile, selection, bytes }
   const [sidebarTab, setSidebarTab] = useState('tables') // 'tables', 'diffs', 'search', 'finder', 'rev'
 
   const viewModes = ['hex', 'u8', 'i8', 'u16', 'i16', 'u32', 'i32']
@@ -430,6 +506,23 @@ function App() {
     reader.readAsArrayBuffer(file)
   }
 
+  // Download/export file
+  const handleDownloadFile = (data, fileName) => {
+    if (!data) return
+    const blob = new Blob([data], { type: 'application/octet-stream' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    // Add _modified suffix before extension
+    const dotIndex = fileName?.lastIndexOf('.') ?? -1
+    const newName = dotIndex > 0
+      ? fileName.slice(0, dotIndex) + '_modified' + fileName.slice(dotIndex)
+      : (fileName || 'file') + '_modified.bin'
+    a.download = newName
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
   // Get files for diff based on diffPair
   const getDiffFiles = () => {
     const files = { A: fileDataA, B: fileDataB, C: fileDataC }
@@ -558,6 +651,19 @@ function App() {
           )}
         </div>
 
+        {/* Export dropdown */}
+        {hasAnyFile && (
+          <ExportDropdown
+            fileDataA={fileDataA}
+            fileDataB={fileDataB}
+            fileDataC={fileDataC}
+            fileNameA={fileNameA}
+            fileNameB={fileNameB}
+            fileNameC={fileNameC}
+            onDownload={handleDownloadFile}
+          />
+        )}
+
         {/* Compare mode toggle (when at least 2 files loaded) */}
         {loadedFilesCount >= 2 && !viewingTable && (
           <>
@@ -670,6 +776,58 @@ function App() {
                 BE
               </button>
             </div>
+            <button
+              onClick={() => setHeatmapEnabled(!heatmapEnabled)}
+              className={`px-2 py-1 rounded text-xs transition-colors ${
+                heatmapEnabled ? 'bg-gradient-to-r from-blue-500 via-green-500 to-red-500 text-white' : 'text-gray-400 hover:bg-gray-700'
+              }`}
+              title="Toggle heatmap coloring"
+            >
+              Heat
+            </button>
+            <div className="relative">
+              <button
+                onClick={() => setShowFormulaInput(!showFormulaInput)}
+                className={`px-2 py-1 rounded text-xs transition-colors ${
+                  formula ? 'bg-purple-600 text-white' : 'text-gray-400 hover:bg-gray-700'
+                }`}
+                title="Value formula (e.g., x * 0.375 - 23.625)"
+              >
+                f(x)
+              </button>
+              {showFormulaInput && (
+                <div className="absolute top-full left-0 mt-1 bg-gray-800 border border-gray-600 rounded-lg p-2 shadow-xl z-50 w-64">
+                  <div className="text-xs text-gray-400 mb-1">Formula (use x for value)</div>
+                  <input
+                    type="text"
+                    value={formula}
+                    onChange={(e) => setFormula(e.target.value)}
+                    placeholder="x * 0.375 - 23.625"
+                    className="w-full bg-gray-900 border border-gray-600 rounded px-2 py-1 text-sm text-gray-200 font-mono outline-none focus:border-blue-500"
+                    autoFocus
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === 'Escape') {
+                        setShowFormulaInput(false)
+                      }
+                    }}
+                  />
+                  <div className="flex justify-between mt-2">
+                    <button
+                      onClick={() => setFormula('')}
+                      className="text-xs text-gray-500 hover:text-gray-300"
+                    >
+                      Clear
+                    </button>
+                    <button
+                      onClick={() => setShowFormulaInput(false)}
+                      className="text-xs bg-blue-600 hover:bg-blue-500 text-white px-2 py-0.5 rounded"
+                    >
+                      Apply
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
             <div className="h-4 w-px bg-gray-600" />
             <button
               onClick={() => {
@@ -684,14 +842,7 @@ function App() {
         )}
 
         {/* Status info */}
-        <div className="ml-auto flex items-center gap-3">
-          <span className="text-gray-600 text-sm">
-            {fileDataA && `A: ${fileDataA.length.toLocaleString()}B`}
-            {fileDataA && fileDataB && ' | '}
-            {fileDataB && `B: ${fileDataB.length.toLocaleString()}B`}
-            {(fileDataA || fileDataB) && fileDataC && ' | '}
-            {fileDataC && `C: ${fileDataC.length.toLocaleString()}B`}
-          </span>
+        <div className="ml-auto flex items-center gap-3 shrink-0">
           <span className="text-gray-600 text-xs flex items-center gap-1" title="Project auto-saved to browser storage">
             <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
               <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
@@ -780,6 +931,24 @@ function App() {
                 >
                   Rev
                 </button>
+                <button
+                  onClick={() => setSidebarTab('map')}
+                  className={`px-2 py-1.5 text-xs font-medium whitespace-nowrap transition-colors ${
+                    sidebarTab === 'map' ? 'text-cyan-400 border-b-2 border-cyan-400' : 'text-gray-500 hover:text-gray-300'
+                  }`}
+                  title="MAP sensor finder"
+                >
+                  MAP
+                </button>
+                <button
+                  onClick={() => setSidebarTab('checksum')}
+                  className={`px-2 py-1.5 text-xs font-medium whitespace-nowrap transition-colors ${
+                    sidebarTab === 'checksum' ? 'text-cyan-400 border-b-2 border-cyan-400' : 'text-gray-500 hover:text-gray-300'
+                  }`}
+                  title="Checksum calculator"
+                >
+                  CS
+                </button>
               </div>
 
               {/* Tab content */}
@@ -792,42 +961,52 @@ function App() {
                       onSelect={handleSelectTable}
                       onEdit={handleEditTable}
                       onDelete={handleDeleteTable}
+                      onGoToOffset={(offset) => {
+                        setViewingTable(null)
+                        setSelectedTableId(null)
+                        hexViewerRef.current?.goToOffset(offset)
+                      }}
                     />
                   </div>
                 )}
 
                 {sidebarTab === 'diffs' && loadedFilesCount >= 2 && (
-                  <div className="flex-1 overflow-hidden flex flex-col">
-                    <div className="px-2 py-1 border-b border-gray-700 flex items-center justify-end">
-                      <span className="text-purple-400 text-xs font-mono">{diffPair}</span>
-                    </div>
-                    <div className="flex-1 overflow-hidden">
-                      <DiffList
-                        dataA={getDiffFiles().dataA}
-                        dataB={getDiffFiles().dataB}
-                        diffPair={diffPair}
-                        onGoToOffset={(offset) => {
-                          setViewingTable(null)
-                          setSelectedTableId(null)
-                          hexViewerRef.current?.goToOffset(offset)
-                        }}
-                        onViewAsTable={(range) => {
-                          const cols = Math.min(16, range.size)
-                          const rows = Math.ceil(range.size / cols)
-                          setViewingTable({
-                            id: `diff-${range.start}-${range.end}`,
-                            name: `Diff @ 0x${range.start.toString(16).toUpperCase()}`,
-                            offset: range.start,
-                            rows,
-                            cols,
-                            dataType: 'u8',
-                            isTemporary: true,
-                          })
-                          setSelectedTableId(null)
-                        }}
-                      />
-                    </div>
-                  </div>
+                  <DiffList
+                    dataA={fileDataA}
+                    dataB={fileDataB}
+                    dataC={fileDataC}
+                    onGoToOffset={(offset) => {
+                      setViewingTable(null)
+                      setSelectedTableId(null)
+                      hexViewerRef.current?.goToOffset(offset)
+                    }}
+                    onViewAsTable={(range) => {
+                      const cols = Math.min(16, range.size)
+                      const rows = Math.ceil(range.size / cols)
+                      setViewingTable({
+                        id: `diff-${range.start}-${range.end}`,
+                        name: `Diff @ 0x${range.start.toString(16).toUpperCase()}`,
+                        offset: range.start,
+                        rows,
+                        cols,
+                        dataType: 'u8',
+                        isTemporary: true,
+                      })
+                      setSelectedTableId(null)
+                    }}
+                    onSaveAsTable={(tableData) => {
+                      const newTable = {
+                        id: Date.now().toString(),
+                        name: tableData.name,
+                        offset: tableData.offset,
+                        rows: tableData.rows,
+                        cols: tableData.cols,
+                        dataType: tableData.dataType,
+                      }
+                      setTables(prev => [...prev, newTable])
+                      setSidebarTab('tables')
+                    }}
+                  />
                 )}
 
                 {sidebarTab === 'search' && (
@@ -850,6 +1029,11 @@ function App() {
                     dataB={fileDataB}
                     dataC={fileDataC}
                     endianness={endianness}
+                    onGoToOffset={(offset) => {
+                      setViewingTable(null)
+                      setSelectedTableId(null)
+                      hexViewerRef.current?.goToOffset(offset)
+                    }}
                     onViewAsTable={(range) => {
                       setViewingTable({
                         id: `found-${range.start}`,
@@ -890,6 +1074,63 @@ function App() {
                     }}
                   />
                 )}
+
+                {sidebarTab === 'map' && (
+                  <MapSensorFinder
+                    dataA={fileDataA}
+                    dataB={fileDataB}
+                    dataC={fileDataC}
+                    endianness={endianness}
+                    onGoToOffset={(offset) => {
+                      setViewingTable(null)
+                      setSelectedTableId(null)
+                      hexViewerRef.current?.goToOffset(offset)
+                    }}
+                    onViewAsTable={(range) => {
+                      setViewingTable({
+                        id: `map-${range.start}`,
+                        name: `MAP @ 0x${range.start.toString(16).toUpperCase()}`,
+                        offset: range.start,
+                        rows: range.rows,
+                        cols: range.cols,
+                        dataType: range.dataType,
+                        isTemporary: true,
+                      })
+                      setSelectedTableId(null)
+                    }}
+                    onSaveAsTable={(tableData) => {
+                      const newTable = {
+                        id: Date.now().toString(),
+                        name: tableData.name,
+                        offset: tableData.offset,
+                        rows: tableData.rows,
+                        cols: tableData.cols,
+                        dataType: tableData.dataType,
+                      }
+                      setTables(prev => [...prev, newTable])
+                      setSidebarTab('tables')
+                    }}
+                  />
+                )}
+
+                {sidebarTab === 'checksum' && (
+                  <ChecksumCalculator
+                    dataA={fileDataA}
+                    dataB={fileDataB}
+                    dataC={fileDataC}
+                    endianness={endianness}
+                    onGoToOffset={(offset) => {
+                      setViewingTable(null)
+                      setSelectedTableId(null)
+                      hexViewerRef.current?.goToOffset(offset)
+                    }}
+                    onUpdateData={(file, newData) => {
+                      if (file === 'A') setFileDataA(newData)
+                      else if (file === 'B') setFileDataB(newData)
+                      else if (file === 'C') setFileDataC(newData)
+                    }}
+                  />
+                )}
               </div>
             </div>
 
@@ -900,9 +1141,27 @@ function App() {
                 dataA={fileDataA}
                 dataB={fileDataB}
                 dataC={fileDataC}
+                formula={formula}
+                tables={tables}
+                endianness={endianness}
+                clipboard={clipboard}
+                onSetClipboard={setClipboard}
                 onClose={() => {
                   setViewingTable(null)
                   setSelectedTableId(null)
+                }}
+                onUpdateTable={(updatedTable) => {
+                  // Update in tables list if it's a saved table
+                  if (!updatedTable.isTemporary) {
+                    setTables(prev => prev.map(t => t.id === updatedTable.id ? updatedTable : t))
+                  }
+                  // Update the viewing table
+                  setViewingTable(updatedTable)
+                }}
+                onUpdateBinary={(file, newData) => {
+                  if (file === 'A') setFileDataA(newData)
+                  else if (file === 'B') setFileDataB(newData)
+                  else if (file === 'C') setFileDataC(newData)
                 }}
               />
             ) : (
@@ -914,6 +1173,13 @@ function App() {
                 viewMode={viewMode}
                 compareMode={compareMode}
                 endianness={endianness}
+                heatmapEnabled={heatmapEnabled}
+                formula={formula}
+                tables={tables}
+                onSelectTable={(table) => {
+                  setSelectedTableId(table.id)
+                  setViewingTable(table)
+                }}
               />
             )}
 
@@ -926,6 +1192,7 @@ function App() {
               }}
               onSave={handleSaveTable}
               editTable={editingTable}
+              tables={tables}
             />
           </>
         ) : (

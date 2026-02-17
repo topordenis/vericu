@@ -180,8 +180,241 @@ function findRegionBoundaries(data, startOffset, valueSize, isLE, minSize = 64) 
   return null
 }
 
+// Calculate monotonicity score (how consistently values increase/decrease)
+function calculateMonotonicity(values, rows, cols) {
+  let rowMonoScore = 0
+  let colMonoScore = 0
+
+  // Check row monotonicity (do values consistently increase/decrease along columns?)
+  for (let r = 0; r < rows; r++) {
+    let increasing = 0, decreasing = 0, total = 0
+    for (let c = 0; c < cols - 1; c++) {
+      const diff = values[r][c + 1] - values[r][c]
+      if (diff > 0) increasing++
+      else if (diff < 0) decreasing++
+      total++
+    }
+    if (total > 0) {
+      // Score is high if mostly increasing OR mostly decreasing
+      rowMonoScore += Math.max(increasing, decreasing) / total
+    }
+  }
+  rowMonoScore /= rows
+
+  // Check column monotonicity (do values consistently increase/decrease along rows?)
+  for (let c = 0; c < cols; c++) {
+    let increasing = 0, decreasing = 0, total = 0
+    for (let r = 0; r < rows - 1; r++) {
+      const diff = values[r + 1][c] - values[r][c]
+      if (diff > 0) increasing++
+      else if (diff < 0) decreasing++
+      total++
+    }
+    if (total > 0) {
+      colMonoScore += Math.max(increasing, decreasing) / total
+    }
+  }
+  colMonoScore /= cols
+
+  return { rowMono: rowMonoScore, colMono: colMonoScore }
+}
+
+// Calculate heatmap-style pattern score (local color coherence)
+function calculateHeatmapScore(values, rows, cols, min, max) {
+  if (max === min) return 0
+  const range = max - min
+
+  let coherenceScore = 0
+  let count = 0
+
+  // Check how similar adjacent cells are (like smooth heatmap colors)
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const val = values[r][c]
+      const neighbors = []
+
+      if (r > 0) neighbors.push(values[r - 1][c])
+      if (r < rows - 1) neighbors.push(values[r + 1][c])
+      if (c > 0) neighbors.push(values[r][c - 1])
+      if (c < cols - 1) neighbors.push(values[r][c + 1])
+
+      if (neighbors.length > 0) {
+        const avgNeighborDiff = neighbors.reduce((sum, n) => sum + Math.abs(n - val), 0) / neighbors.length
+        // Coherence is high when neighbors are similar (small diff relative to range)
+        coherenceScore += 1 - Math.min(1, avgNeighborDiff / (range * 0.5))
+        count++
+      }
+    }
+  }
+
+  return count > 0 ? coherenceScore / count : 0
+}
+
+// Parse a formula string into a function
+function parseFormula(formulaStr) {
+  try {
+    // eslint-disable-next-line no-new-func
+    return new Function('x', `return ${formulaStr}`)
+  } catch {
+    return null
+  }
+}
+
+// Advanced Ignition Table Detection Algorithm
+// Ignition maps have specific characteristics:
+// - Values typically represent timing advance in degrees
+// - Common raw value ranges that convert to -10° to 60° advance
+// - Characteristic "dome" or "hill" shape - peak advance in mid-RPM/mid-load
+// - Gradual decrease at high load (knock prevention)
+// - Smooth transitions, no sudden jumps > 5-10 degrees between cells
+function analyzeIgnitionTable(values, rows, cols, min, max, dataType, customFormula = null) {
+  const range = max - min
+  if (range === 0) return { score: 0, formula: null }
+
+  // Use custom formula if provided, otherwise try common ones
+  let formulasToTry = []
+
+  if (customFormula) {
+    const fn = parseFormula(customFormula)
+    if (fn) {
+      formulasToTry = [{ fn, name: customFormula }]
+    }
+  }
+
+  if (formulasToTry.length === 0) {
+    // Fallback to common formulas
+    formulasToTry = [
+      { fn: x => x * 0.75 - 10, name: 'x*0.75-10' },
+      { fn: x => x * 0.5 - 20, name: 'x*0.5-20' },
+      { fn: x => x * 0.5, name: 'x*0.5' },
+      { fn: x => x * 0.375 - 23.625, name: 'x*0.375-23.625' },
+      { fn: x => x - 40, name: 'x-40' },
+      { fn: x => x - 20, name: 'x-20' },
+      { fn: x => x * 0.25, name: 'x*0.25' },
+    ]
+  }
+
+  let bestFormula = null
+  let bestScore = 0
+
+  for (const formula of formulasToTry) {
+    // Convert all values using this formula
+    const converted = values.map(row => row.map(v => {
+      try { return formula.fn(v) } catch { return v }
+    }))
+    const convMin = formula.fn(min)
+    const convMax = formula.fn(max)
+
+    // Check 1: Typical ignition range (-15 to 65 degrees)
+    const inTypicalRange = convMin >= -15 && convMax <= 65 && convMax > 0
+    if (!inTypicalRange && !customFormula) continue
+
+    // If custom formula, give base score even if out of typical range
+    let score = customFormula ? 10 : 20
+
+    // Check 2: "Dome" shape detection - values should peak somewhere in the middle
+    // and decrease towards edges (especially high load = bottom rows typically)
+    let hasDomeShape = false
+    const midRow = Math.floor(rows / 2)
+    const midCol = Math.floor(cols / 2)
+
+    // Sample center region vs edges
+    const centerAvg = getRegionAverage(converted,
+      Math.floor(rows * 0.3), Math.floor(rows * 0.7),
+      Math.floor(cols * 0.3), Math.floor(cols * 0.7))
+    const topAvg = getRegionAverage(converted, 0, Math.floor(rows * 0.2), 0, cols)
+    const bottomAvg = getRegionAverage(converted, Math.floor(rows * 0.8), rows, 0, cols)
+    const leftAvg = getRegionAverage(converted, 0, rows, 0, Math.floor(cols * 0.2))
+    const rightAvg = getRegionAverage(converted, 0, rows, Math.floor(cols * 0.8), cols)
+
+    // Center should be higher or similar to edges (dome shape)
+    const edgeAvg = (topAvg + bottomAvg + leftAvg + rightAvg) / 4
+    if (centerAvg >= edgeAvg * 0.9) {
+      score += 15
+      hasDomeShape = true
+    }
+
+    // Check 3: Bottom rows (high load) typically have less advance
+    if (bottomAvg < centerAvg) {
+      score += 10 // Knock prevention pattern
+    }
+
+    // Check 4: Smooth transitions - ignition maps don't have huge jumps
+    let smoothTransitions = 0
+    let totalTransitions = 0
+    const maxJump = 8 // Max expected jump in degrees
+
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols - 1; c++) {
+        const jump = Math.abs(converted[r][c + 1] - converted[r][c])
+        if (jump <= maxJump) smoothTransitions++
+        totalTransitions++
+      }
+    }
+    for (let r = 0; r < rows - 1; r++) {
+      for (let c = 0; c < cols; c++) {
+        const jump = Math.abs(converted[r + 1][c] - converted[r][c])
+        if (jump <= maxJump) smoothTransitions++
+        totalTransitions++
+      }
+    }
+
+    const smoothnessRatio = totalTransitions > 0 ? smoothTransitions / totalTransitions : 0
+    score += smoothnessRatio * 25
+
+    // Check 5: Variance check - ignition maps have meaningful variance
+    const variance = calculateVariance(converted)
+    const stdDev = Math.sqrt(variance)
+
+    // Typical ignition map has 5-25 degree spread
+    if (stdDev >= 3 && stdDev <= 20) {
+      score += 15
+    }
+
+    // Check 6: Row progression analysis
+    // In many ignition maps, each column shows a trend with RPM (rows)
+    let consistentColumnTrends = 0
+    for (let c = 0; c < cols; c++) {
+      let increases = 0, decreases = 0
+      for (let r = 0; r < rows - 1; r++) {
+        if (converted[r + 1][c] > converted[r][c]) increases++
+        else if (converted[r + 1][c] < converted[r][c]) decreases++
+      }
+      // Column should show a clear trend
+      if (increases > (rows - 1) * 0.6 || decreases > (rows - 1) * 0.6) {
+        consistentColumnTrends++
+      }
+    }
+    score += (consistentColumnTrends / cols) * 15
+
+    if (score > bestScore) {
+      bestScore = score
+      bestFormula = formula
+    }
+  }
+
+  return { score: bestScore, formula: bestFormula }
+}
+
+function getRegionAverage(values, rowStart, rowEnd, colStart, colEnd) {
+  let sum = 0, count = 0
+  for (let r = rowStart; r < rowEnd && r < values.length; r++) {
+    for (let c = colStart; c < colEnd && c < values[r].length; c++) {
+      sum += values[r][c]
+      count++
+    }
+  }
+  return count > 0 ? sum / count : 0
+}
+
+function calculateVariance(values) {
+  const flat = values.flat()
+  const mean = flat.reduce((a, b) => a + b, 0) / flat.length
+  return flat.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / flat.length
+}
+
 // Main analysis function for a candidate region
-function analyzeCandidate(data, offset, rows, cols, dataType, isLE) {
+function analyzeCandidate(data, offset, rows, cols, dataType, isLE, detectIgnition = false) {
   const size = dataType.includes('8') ? 1 : dataType.includes('16') ? 2 : 4
   const signed = dataType.startsWith('i')
   const totalBytes = rows * cols * size
@@ -281,20 +514,40 @@ function analyzeCandidate(data, offset, rows, cols, dataType, isLE) {
     colCorr /= variance
   }
 
+  // Monotonicity analysis (calibration tables often have monotonic axes)
+  const { rowMono, colMono } = calculateMonotonicity(values, rows, cols)
+
+  // Heatmap coherence score (smooth color transitions)
+  const heatmapScore = calculateHeatmapScore(values, rows, cols, min, max)
+
+  // Ignition table detection (advanced algorithm)
+  let ignitionResult = { score: 0, formula: null }
+  if (detectIgnition) {
+    ignitionResult = analyzeIgnitionTable(values, rows, cols, min, max, dataType, detectIgnition === true ? null : detectIgnition)
+  }
+
   // Score calculation
   let score = 0
 
-  score += gradientScore * 35
-  score += Math.max(0, Math.min(1, (rowCorr + colCorr) / 2)) * 25
+  if (detectIgnition && ignitionResult.score > 0) {
+    // Use ignition-specific scoring when in ignition mode
+    score = ignitionResult.score
+  } else {
+    // Standard scoring
+    score += gradientScore * 25
+    score += Math.max(0, Math.min(1, (rowCorr + colCorr) / 2)) * 15
+    score += ((rowMono + colMono) / 2) * 20  // Monotonicity bonus
+    score += heatmapScore * 20  // Heatmap coherence bonus
 
-  // Size bonus
-  if (rows >= 4 && cols >= 4) score += 10
-  if (rows >= 8 && cols >= 8) score += 10
-  if (rows * cols >= 64) score += 10
+    // Size bonus
+    if (rows >= 4 && cols >= 4) score += 5
+    if (rows >= 8 && cols >= 8) score += 5
+    if (rows * cols >= 64) score += 5
 
-  // Penalize very small or very large tables
-  if (rows < 3 || cols < 3) score -= 20
-  if (rows > 64 || cols > 64) score -= 10
+    // Penalize very small or very large tables
+    if (rows < 3 || cols < 3) score -= 20
+    if (rows > 64 || cols > 64) score -= 10
+  }
 
   return {
     offset,
@@ -302,6 +555,8 @@ function analyzeCandidate(data, offset, rows, cols, dataType, isLE) {
     cols,
     dataType,
     score: Math.max(0, Math.min(100, score)),
+    isIgnition: detectIgnition && ignitionResult.score > 50,
+    ignitionFormula: ignitionResult.formula?.name || null,
     stats: {
       min,
       max,
@@ -310,17 +565,23 @@ function analyzeCandidate(data, offset, rows, cols, dataType, isLE) {
       gradientScore: gradientScore.toFixed(2),
       rowCorr: rowCorr.toFixed(2),
       colCorr: colCorr.toFixed(2),
+      rowMono: rowMono.toFixed(2),
+      colMono: colMono.toFixed(2),
+      heatmap: heatmapScore.toFixed(2),
+      ignitionScore: ignitionResult.score.toFixed(0),
     }
   }
 }
 
-function MapFinder({ dataA, dataB, dataC, endianness, onViewAsTable, onSaveAsTable }) {
+function MapFinder({ dataA, dataB, dataC, endianness, onViewAsTable, onSaveAsTable, onGoToOffset }) {
   const [searchIn, setSearchIn] = useState('A')
   const [isSearching, setIsSearching] = useState(false)
   const [progress, setProgress] = useState(0)
   const [results, setResults] = useState([])
   const [minScore, setMinScore] = useState(40)
   const [dataTypes, setDataTypes] = useState(['u8', 'u16', 'u32', 'i8', 'i16', 'i32'])
+  const [ignitionMode, setIgnitionMode] = useState(false)
+  const [ignitionFormula, setIgnitionFormula] = useState('x * 0.75 - 10')
 
   const activeData = searchIn === 'C' ? dataC : searchIn === 'B' ? dataB : dataA
   const isLE = endianness === 'little'
@@ -398,7 +659,7 @@ function MapFinder({ dataA, dataB, dataC, endianness, onViewAsTable, onSaveAsTab
               const totalSize = rows * cols * valueSize
               if (offset + totalSize > activeData.length) break
 
-              const result = analyzeCandidate(activeData, offset, rows, cols, dataType, isLE)
+              const result = analyzeCandidate(activeData, offset, rows, cols, dataType, isLE, ignitionMode ? ignitionFormula : false)
 
               if (result && result.score >= minScore) {
                 // Check for overlap with better existing candidates
@@ -442,7 +703,7 @@ function MapFinder({ dataA, dataB, dataC, endianness, onViewAsTable, onSaveAsTab
               const totalSize = rows * cols * valueSize
               if (offset + totalSize > activeData.length) continue
 
-              const result = analyzeCandidate(activeData, offset, rows, cols, dataType, isLE)
+              const result = analyzeCandidate(activeData, offset, rows, cols, dataType, isLE, ignitionMode ? ignitionFormula : false)
 
               if (result && result.score >= minScore) {
                 const dominated = candidates.some(c => {
@@ -495,7 +756,7 @@ function MapFinder({ dataA, dataB, dataC, endianness, onViewAsTable, onSaveAsTab
     }
 
     setTimeout(() => processChunk(0), 0)
-  }, [activeData, dataTypes, minScore, isLE])
+  }, [activeData, dataTypes, minScore, isLE, ignitionMode, ignitionFormula])
 
   const formatOffset = (offset) => {
     return '0x' + offset.toString(16).toUpperCase().padStart(6, '0')
@@ -572,6 +833,36 @@ function MapFinder({ dataA, dataB, dataC, endianness, onViewAsTable, onSaveAsTab
           ))}
         </div>
 
+        <button
+          onClick={() => setIgnitionMode(!ignitionMode)}
+          disabled={isSearching}
+          className={`w-full px-2 py-1 rounded text-xs font-medium transition-colors ${
+            ignitionMode
+              ? 'bg-orange-600 text-white'
+              : 'bg-gray-700 text-gray-400 hover:bg-gray-600'
+          }`}
+          title="Advanced ignition table detection with timing-specific patterns"
+        >
+          {ignitionMode ? '🔥 Ignition Mode ON' : 'Ignition Table Detection'}
+        </button>
+
+        {ignitionMode && (
+          <div className="space-y-1">
+            <div className="text-xs text-gray-400">Timing formula (use x):</div>
+            <input
+              type="text"
+              value={ignitionFormula}
+              onChange={(e) => setIgnitionFormula(e.target.value)}
+              placeholder="x * 0.75 - 10"
+              disabled={isSearching}
+              className="w-full bg-gray-900 border border-gray-600 rounded px-2 py-1 text-xs text-gray-200 font-mono outline-none focus:border-orange-500"
+            />
+            <div className="text-xs text-gray-600">
+              Expects result in degrees (-15° to 65°)
+            </div>
+          </div>
+        )}
+
         {results.length > 0 && (
           <div className="flex items-center justify-between">
             <span className="text-xs text-green-400">
@@ -621,9 +912,13 @@ function MapFinder({ dataA, dataB, dataC, endianness, onViewAsTable, onSaveAsTab
                 className="px-2 py-2 hover:bg-gray-700 group"
               >
                 <div className="flex items-center justify-between">
-                  <span className="text-gray-200 text-xs font-mono">
+                  <button
+                    onClick={() => onGoToOffset(result.offset)}
+                    className="text-blue-400 hover:text-blue-300 text-xs font-mono hover:underline"
+                    title="Go to offset in hex view"
+                  >
                     {formatOffset(result.offset)}
-                  </span>
+                  </button>
                   <div className="flex items-center gap-2">
                     <span className={`text-xs font-bold ${
                       result.score >= 60 ? 'text-green-400' :
@@ -671,10 +966,23 @@ function MapFinder({ dataA, dataB, dataC, endianness, onViewAsTable, onSaveAsTab
                   <span>{result.stats.min}–{result.stats.max}</span>
                 </div>
                 <div className="flex items-center gap-2 mt-0.5 text-xs text-gray-600">
+                  <span title="Heatmap coherence (smooth color transitions)">H:{result.stats.heatmap}</span>
+                  <span title="Monotonicity (consistent increase/decrease)">M:{((parseFloat(result.stats.rowMono) + parseFloat(result.stats.colMono)) / 2).toFixed(2)}</span>
                   <span title="Gradient smoothness">G:{result.stats.gradientScore}</span>
-                  <span title="Row correlation">R:{result.stats.rowCorr}</span>
-                  <span title="Column correlation">C:{result.stats.colCorr}</span>
                 </div>
+                {result.isIgnition && (
+                  <div className="flex items-center gap-2 mt-1 text-xs">
+                    <span className="text-orange-400 font-medium">🔥 Ignition Table</span>
+                    {result.ignitionFormula && (
+                      <span className="text-orange-300 font-mono bg-orange-900/30 px-1 rounded">
+                        {result.ignitionFormula}
+                      </span>
+                    )}
+                    <span className="text-gray-600" title="Ignition detection score">
+                      I:{result.stats.ignitionScore}
+                    </span>
+                  </div>
+                )}
               </div>
             ))}
           </div>
