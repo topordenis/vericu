@@ -22,7 +22,10 @@ const HexViewer = forwardRef(function HexViewer({
   compareMode = 'A', // 'A', 'B', 'C', or 'diff'
   endianness = 'little', // 'little' or 'big'
   heatmapEnabled = false,
-  formula = ''
+  formula = '',
+  tables = [],
+  onSelectTable,
+  offsetDeltaB = null, // offset delta for rebasing File B to File A's address space
 }, ref) {
   const containerRef = useRef(null)
   const [cursorPos, setCursorPos] = useState(0)
@@ -30,6 +33,7 @@ const HexViewer = forwardRef(function HexViewer({
   const [showGoTo, setShowGoTo] = useState(false)
   const [goToValue, setGoToValue] = useState('')
   const goToInputRef = useRef(null)
+  const [highlightRange, setHighlightRange] = useState(null) // { start, end }
 
   // Selection state
   const [selectionStart, setSelectionStart] = useState(null)
@@ -41,9 +45,26 @@ const HexViewer = forwardRef(function HexViewer({
   const fileA = dataA || data
   const fileB = dataB
   const fileC = dataC
-  const activeData = compareMode === 'C' && fileC ? fileC : compareMode === 'B' && fileB ? fileB : fileA
   const hasBothFiles = fileA && fileB
   const isDiffMode = compareMode === 'diff' && hasBothFiles
+
+  // Rebase File B offset: convert File A address space → File B address space
+  const rebaseB = useCallback((offsetInA) => {
+    if (offsetDeltaB == null || !fileB) return offsetInA
+    const offsetInB = offsetInA + offsetDeltaB
+    if (offsetInB < 0 || offsetInB >= fileB.length) return -1
+    return offsetInB
+  }, [offsetDeltaB, fileB])
+
+  // Read from File B at an address in File A's space
+  const readFileB = useCallback((offsetInA) => {
+    if (!fileB) return undefined
+    const off = rebaseB(offsetInA)
+    if (off < 0 || off >= fileB.length) return undefined
+    return fileB[off]
+  }, [fileB, rebaseB])
+
+  const activeData = compareMode === 'C' && fileC ? fileC : compareMode === 'B' && fileB ? fileB : fileA
 
   const mode = VIEW_MODES[viewMode] || VIEW_MODES.hex
   const itemsPerRow = mode.perRow
@@ -52,6 +73,31 @@ const HexViewer = forwardRef(function HexViewer({
 
   const maxLength = Math.max(fileA?.length || 0, fileB?.length || 0, fileC?.length || 0)
   const totalRows = Math.ceil(maxLength / bytesPerRow)
+
+  // Build lookup for table markers - which rows have tables starting
+  const tableMarkers = useMemo(() => {
+    const markers = new Map()
+    for (const table of tables) {
+      const startRow = Math.floor(table.offset / bytesPerRow)
+      if (!markers.has(startRow)) {
+        markers.set(startRow, [])
+      }
+      markers.get(startRow).push(table)
+    }
+    return markers
+  }, [tables, bytesPerRow])
+
+  // Check if an offset is within any table range
+  const getTableAtOffset = useCallback((offset) => {
+    for (const table of tables) {
+      const typeSize = VIEW_MODES[table.dataType]?.size || 1
+      const tableSize = table.rows * table.cols * typeSize
+      if (offset >= table.offset && offset < table.offset + tableSize) {
+        return table
+      }
+    }
+    return null
+  }, [tables])
 
   const goToOffset = useCallback((offset) => {
     const pos = Math.max(0, Math.min(maxLength - 1, offset))
@@ -87,10 +133,16 @@ const HexViewer = forwardRef(function HexViewer({
     setTimeout(() => goToInputRef.current?.select(), 0)
   }, [cursorPos])
 
+  const highlightTable = useCallback((offset, byteLength) => {
+    setHighlightRange({ start: offset, end: offset + byteLength })
+    goToOffset(offset)
+  }, [goToOffset])
+
   useImperativeHandle(ref, () => ({
     goToOffset,
     openGoToDialog,
-  }), [goToOffset, openGoToDialog])
+    highlightTable,
+  }), [goToOffset, openGoToDialog, highlightTable])
 
   const ensureCursorVisible = useCallback((pos) => {
     const cursorRow = Math.floor(pos / bytesPerRow)
@@ -184,6 +236,7 @@ const HexViewer = forwardRef(function HexViewer({
     setSelectionEnd(index)
     setIsSelecting(true)
     setCursorPos(index)
+    setHighlightRange(null)
   }, [])
 
   const handleMouseMove = useCallback((index) => {
@@ -223,6 +276,11 @@ const HexViewer = forwardRef(function HexViewer({
     return row >= bounds.minRow && row <= bounds.maxRow &&
            col >= bounds.minCol && col <= bounds.maxCol
   }, [getSelectionBounds, bytesPerRow, itemSize])
+
+  const isHighlighted = useCallback((index) => {
+    if (!highlightRange) return false
+    return index >= highlightRange.start && index < highlightRange.end
+  }, [highlightRange])
 
   // Apply formula to value
   const applyFormula = useCallback((value) => {
@@ -354,7 +412,8 @@ const HexViewer = forwardRef(function HexViewer({
 
   const formatDiffValue = (offset) => {
     const valA = readValue(fileA, offset, itemSize, mode.signed)
-    const valB = readValue(fileB, offset, itemSize, mode.signed)
+    const offB = rebaseB(offset)
+    const valB = offB >= 0 ? readValue(fileB, offB, itemSize, mode.signed) : null
     if (valA === null || valB === null) return { display: '??', diff: null }
     const diff = valB - valA
     if (viewMode === 'hex') {
@@ -449,6 +508,12 @@ const HexViewer = forwardRef(function HexViewer({
         if (isDiffMode) {
           const { display, diff } = formatDiffValue(byteIndex)
           rowItems.push({ index: byteIndex, value: display, diff, rawValue: null })
+        } else if (compareMode === 'B' && offsetDeltaB != null && fileB) {
+          // View File B rebased to File A's address space
+          const offB = rebaseB(byteIndex)
+          const rawValue = offB >= 0 ? readValue(fileB, offB, itemSize, mode.signed) : null
+          const display = rawValue !== null ? (formula ? formatDisplayValue(rawValue) : rawValue.toString()) : '??'
+          rowItems.push({ index: byteIndex, value: display, diff: null, rawValue })
         } else {
           const rawValue = readValue(activeData, byteIndex, itemSize, mode.signed)
           rowItems.push({ index: byteIndex, value: formatValue(activeData, byteIndex), diff: null, rawValue })
@@ -464,7 +529,7 @@ const HexViewer = forwardRef(function HexViewer({
     for (let j = 0; j < bytesPerRow && rowStart + j < maxLength; j++) {
       const idx = rowStart + j
       const byteA = fileA && idx < fileA.length ? fileA[idx] : undefined
-      const byteB = fileB && idx < fileB.length ? fileB[idx] : undefined
+      const byteB = isDiffMode || compareMode === 'B' ? readFileB(idx) : (fileB && idx < fileB.length ? fileB[idx] : undefined)
       const diff = (byteA !== undefined && byteB !== undefined) ? byteB - byteA : null
 
       let displayByte
@@ -500,10 +565,34 @@ const HexViewer = forwardRef(function HexViewer({
           const rowBytes = getRowBytes(row.offset)
           const isSelected = (index) => index >= cursorPos && index < cursorPos + itemSize
 
+          const rowIndex = Math.floor(row.offset / bytesPerRow)
+          const rowTables = tableMarkers.get(rowIndex) || []
+          const tableAtRow = getTableAtOffset(row.offset)
+
           return (
-            <div key={row.offset} className="flex h-6 leading-6">
+            <div key={row.offset} className="flex h-6 leading-6 group">
+              {/* Table marker column */}
+              <div className="w-20 shrink-0 flex items-center justify-end pr-1 overflow-hidden">
+                {rowTables.length > 0 ? (
+                  <button
+                    onClick={() => onSelectTable?.(rowTables[0])}
+                    className="text-[10px] px-1 py-0 rounded bg-purple-600/80 text-purple-100 truncate max-w-[76px] hover:bg-purple-500 transition-colors"
+                    title={rowTables.map(t => t.name).join(', ')}
+                  >
+                    {rowTables[0].name}
+                  </button>
+                ) : tableAtRow ? (
+                  <span
+                    className="text-[10px] text-purple-400/50 truncate max-w-[76px] cursor-pointer hover:text-purple-300"
+                    onClick={() => onSelectTable?.(tableAtRow)}
+                    title={tableAtRow.name}
+                  >
+                    ┃
+                  </span>
+                ) : null}
+              </div>
               {/* Offset column */}
-              <div className="w-24 text-gray-500 text-right pr-4 shrink-0">
+              <div className="w-20 text-gray-500 text-right pr-4 shrink-0">
                 {row.offset.toString(16).padStart(8, '0').toUpperCase()}
               </div>
 
@@ -512,7 +601,8 @@ const HexViewer = forwardRef(function HexViewer({
                 {row.items.map((item, j) => {
                   const isCurrentPos = item.index === cursorPos
                   const isSelected = isInSelection(item.index)
-                  const useHeatmap = heatmapEnabled && !isDiffMode && item.rawValue !== null && !isSelected
+                  const isHl = isHighlighted(item.index)
+                  const useHeatmap = heatmapEnabled && !isDiffMode && item.rawValue !== null && !isSelected && !isHl
                   let className = `${mode.width} text-center cursor-pointer select-none `
                   let style = undefined
 
@@ -520,6 +610,8 @@ const HexViewer = forwardRef(function HexViewer({
                     className += 'bg-yellow-600/70 text-white'
                   } else if (isCurrentPos) {
                     className += 'bg-blue-600 text-white'
+                  } else if (isHl) {
+                    className += 'bg-purple-600/40 text-purple-200'
                   } else if (isDiffMode) {
                     className += getDiffBgColor(item.diff) + ' ' + getDiffColor(item.diff) + ' hover:bg-gray-700'
                   } else if (useHeatmap) {

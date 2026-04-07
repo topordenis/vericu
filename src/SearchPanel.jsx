@@ -4,13 +4,15 @@ function SearchPanel({ dataA, dataB, dataC, endianness, onGoToOffset }) {
   const [searchValue, setSearchValue] = useState('')
   const [searchType, setSearchType] = useState('hex') // 'hex', 'u8', 'u16', 'u32', 'i8', 'i16', 'i32', 'text'
   const [searchIn, setSearchIn] = useState('A') // 'A', 'B', 'C'
+  const [tolerance, setTolerance] = useState('0') // ±percentage (0 = exact match)
+  const [searchEndian, setSearchEndian] = useState(endianness)
 
   const activeData = searchIn === 'C' ? dataC : searchIn === 'B' ? dataB : dataA
 
   const results = useMemo(() => {
     if (!activeData || !searchValue.trim()) return []
 
-    const isLE = endianness === 'little'
+    const isLE = searchEndian === 'little'
     const matches = []
     const maxResults = 500
 
@@ -66,42 +68,58 @@ function SearchPanel({ dataA, dataB, dataC, endianness, onGoToOffset }) {
         }
       } else {
         // Numeric search (u8, i8, u16, i16, u32, i32)
+        // Supports single value or space/comma-separated sequence
         const size = searchType.includes('8') ? 1 : searchType.includes('16') ? 2 : 4
         const signed = searchType.startsWith('i')
+        const tolPercent = parseInt(tolerance) || 0
 
-        let targetValue = parseInt(searchValue, 10)
-        if (isNaN(targetValue)) return []
+        const targetValues = searchValue.trim().split(/[\s,]+/).map(v => parseFloat(v)).filter(v => !isNaN(v))
+        if (targetValues.length === 0) return []
 
-        // Handle negative values for signed types
-        if (signed && targetValue < 0) {
-          const maxUnsigned = 1 << (size * 8)
-          targetValue = targetValue + maxUnsigned
-        }
-
-        // Convert target to bytes based on endianness
-        const targetBytes = []
-        for (let i = 0; i < size; i++) {
-          if (isLE) {
-            // Little endian: low byte at low address
-            targetBytes.push((targetValue >> (i * 8)) & 0xFF)
-          } else {
-            // Big endian: high byte at low address
-            targetBytes.push((targetValue >> ((size - 1 - i) * 8)) & 0xFF)
-          }
-        }
-
-        for (let i = 0; i <= activeData.length - size && matches.length < maxResults; i++) {
-          let found = true
-          for (let j = 0; j < size; j++) {
-            if (activeData[i + j] !== targetBytes[j]) {
-              found = false
-              break
+        const readValue = (offset) => {
+          if (offset + size > activeData.length) return null
+          let value = 0
+          for (let i = 0; i < size; i++) {
+            if (isLE) {
+              value |= activeData[offset + i] << (i * 8)
+            } else {
+              value |= activeData[offset + i] << ((size - 1 - i) * 8)
             }
           }
-          if (found) {
+          if (signed) {
+            const signBit = 1 << (size * 8 - 1)
+            if (value >= signBit) {
+              value = value - (1 << (size * 8))
+            }
+          }
+          return value
+        }
+
+        const seqLen = targetValues.length
+        const seqBytes = seqLen * size
+
+        for (let i = 0; i <= activeData.length - seqBytes && matches.length < maxResults; i++) {
+          let allMatch = true
+          for (let s = 0; s < seqLen; s++) {
+            const val = readValue(i + s * size)
+            if (val === null) { allMatch = false; break }
+            const target = targetValues[s]
+            if (tolPercent > 0) {
+              const minVal = Math.round(target * (1 - tolPercent / 100))
+              const maxVal = Math.round(target * (1 + tolPercent / 100))
+              if (val < minVal || val > maxVal) { allMatch = false; break }
+            } else {
+              if (val !== target) { allMatch = false; break }
+            }
+          }
+          if (allMatch) {
+            // Read back actual values for preview
+            const vals = []
+            for (let s = 0; s < seqLen; s++) vals.push(readValue(i + s * size))
             matches.push({
               offset: i,
-              preview: targetValue.toString(),
+              preview: vals.join(' '),
+              byteLength: seqBytes,
             })
           }
         }
@@ -112,7 +130,7 @@ function SearchPanel({ dataA, dataB, dataC, endianness, onGoToOffset }) {
     }
 
     return matches
-  }, [activeData, searchValue, searchType, endianness])
+  }, [activeData, searchValue, searchType, searchEndian, tolerance])
 
   const formatOffset = (offset) => {
     return '0x' + offset.toString(16).toUpperCase().padStart(6, '0')
@@ -136,7 +154,7 @@ function SearchPanel({ dataA, dataB, dataC, endianness, onGoToOffset }) {
           type="text"
           value={searchValue}
           onChange={(e) => setSearchValue(e.target.value)}
-          placeholder={searchType === 'hex' ? 'FF 00 1A...' : searchType === 'text' ? 'text...' : 'value...'}
+          placeholder={searchType === 'hex' ? 'FF 00 1A...' : searchType === 'text' ? 'text...' : '200 160 168...'}
           className="w-full bg-gray-800 border border-gray-600 rounded px-2 py-1 text-gray-200 text-xs font-mono outline-none focus:border-blue-500"
         />
         <div className="flex items-center gap-2">
@@ -154,6 +172,27 @@ function SearchPanel({ dataA, dataB, dataC, endianness, onGoToOffset }) {
             <option value="u32">U32</option>
             <option value="i32">I32</option>
           </select>
+          {searchType !== 'hex' && searchType !== 'text' && (
+            <>
+              <input
+                type="number"
+                min="0"
+                max="50"
+                value={tolerance}
+                onChange={(e) => setTolerance(e.target.value)}
+                placeholder="±%"
+                className="w-12 bg-gray-700 text-gray-300 text-xs rounded px-1 py-1 outline-none focus:border-blue-500"
+                title="Tolerance ±% (0 = exact match)"
+              />
+              <button
+                onClick={() => setSearchEndian(e => e === 'little' ? 'big' : 'little')}
+                className={`px-1.5 py-1 rounded text-xs font-medium ${searchEndian === 'big' ? 'bg-gray-600 text-white' : 'text-gray-400 bg-gray-700'}`}
+                title={searchEndian === 'big' ? 'Big Endian' : 'Little Endian'}
+              >
+                {searchEndian === 'big' ? 'BE' : 'LE'}
+              </button>
+            </>
+          )}
           <select
             value={searchIn}
             onChange={(e) => setSearchIn(e.target.value)}
@@ -189,7 +228,7 @@ function SearchPanel({ dataA, dataB, dataC, endianness, onGoToOffset }) {
                   <span className="text-gray-200 text-xs font-mono">
                     {formatOffset(result.offset)}
                   </span>
-                  <span className="text-green-400 text-xs font-mono truncate ml-2">
+                  <span className={`text-xs font-mono truncate ml-2 ${result.diff !== undefined ? (result.diff > 0 ? 'text-green-400' : result.diff < 0 ? 'text-red-400' : 'text-gray-200') : 'text-green-400'}`}>
                     {result.preview}
                   </span>
                 </div>

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import HexViewer from './HexViewer'
 import TableModal from './TableModal'
 import TableList from './TableList'
@@ -17,13 +17,68 @@ import {
   readFromHandle,
   removeFileHandle,
 } from './fileSystem'
+import { parseA2LToTables, mergeA2LTables } from './a2lParser'
+import { parseIntelHex, isIntelHex } from './hexFileParser'
+import { matchTables } from './tableMatcher'
 
 const STORAGE_KEY = 'webols-project'
 const TYPE_SIZES_MAP = { u8: 1, i8: 1, u16: 2, i16: 2, u32: 4, i32: 4 }
 
-function ExportDropdown({ fileDataA, fileDataB, fileDataC, fileNameA, fileNameB, fileNameC, onDownload }) {
+/**
+ * Process loaded file data — detects Intel HEX format and converts to raw binary.
+ * Returns { data: Uint8Array, baseAddress: number }
+ */
+function processFileData(rawData) {
+  if (rawData[0] === 0x3A) { // ':' — possible Intel HEX
+    try {
+      const text = new TextDecoder().decode(rawData)
+      if (isIntelHex(text)) {
+        const result = parseIntelHex(text)
+        if (result) return { data: result.data, baseAddress: result.startAddress }
+      }
+    } catch { /* not HEX, use raw */ }
+  }
+  return { data: rawData, baseAddress: 0 }
+}
+
+function ExportDropdown({
+  fileDataA,
+  fileDataB,
+  fileDataC,
+  fileNameA,
+  fileNameB,
+  fileNameC,
+  onDownload,
+  onSaveAs,
+}) {
   const [isOpen, setIsOpen] = useState(false)
   const dropdownRef = useRef(null)
+
+  const ExportItem = ({ data, name, label, badgeClass, textClass }) => (
+    <div className="flex items-center gap-1 px-2 py-1">
+      <button
+        onClick={() => {
+          onDownload(data, name)
+          setIsOpen(false)
+        }}
+        className={`flex-1 px-2 py-1.5 text-left text-sm ${textClass} hover:bg-gray-700 rounded flex items-center gap-2`}
+      >
+        <span className={`w-4 h-4 rounded ${badgeClass} text-xs flex items-center justify-center text-white`}>
+          {label}
+        </span>
+        {name || `File ${label}`}
+      </button>
+      <button
+        onClick={() => {
+          onSaveAs?.(data, name)
+          setIsOpen(false)
+        }}
+        className={`px-2 py-1 rounded text-xs ${textClass} hover:bg-gray-700`}
+      >
+        Save As
+      </button>
+    </div>
+  )
 
   useEffect(() => {
     const handleClickOutside = (e) => {
@@ -49,40 +104,31 @@ function ExportDropdown({ fileDataA, fileDataB, fileDataC, fileNameA, fileNameB,
       {isOpen && (
         <div className="absolute top-full left-0 mt-1 bg-gray-800 border border-gray-600 rounded-lg shadow-xl z-50 py-1 min-w-[140px]">
           {fileDataA && (
-            <button
-              onClick={() => {
-                onDownload(fileDataA, fileNameA)
-                setIsOpen(false)
-              }}
-              className="w-full px-3 py-1.5 text-left text-sm text-blue-300 hover:bg-gray-700 flex items-center gap-2"
-            >
-              <span className="w-4 h-4 rounded bg-blue-600 text-xs flex items-center justify-center text-white">A</span>
-              {fileNameA || 'File A'}
-            </button>
+            <ExportItem
+              data={fileDataA}
+              name={fileNameA}
+              label="A"
+              badgeClass="bg-blue-600"
+              textClass="text-blue-300"
+            />
           )}
           {fileDataB && (
-            <button
-              onClick={() => {
-                onDownload(fileDataB, fileNameB)
-                setIsOpen(false)
-              }}
-              className="w-full px-3 py-1.5 text-left text-sm text-green-300 hover:bg-gray-700 flex items-center gap-2"
-            >
-              <span className="w-4 h-4 rounded bg-green-600 text-xs flex items-center justify-center text-white">B</span>
-              {fileNameB || 'File B'}
-            </button>
+            <ExportItem
+              data={fileDataB}
+              name={fileNameB}
+              label="B"
+              badgeClass="bg-green-600"
+              textClass="text-green-300"
+            />
           )}
           {fileDataC && (
-            <button
-              onClick={() => {
-                onDownload(fileDataC, fileNameC)
-                setIsOpen(false)
-              }}
-              className="w-full px-3 py-1.5 text-left text-sm text-orange-300 hover:bg-gray-700 flex items-center gap-2"
-            >
-              <span className="w-4 h-4 rounded bg-orange-600 text-xs flex items-center justify-center text-white">C</span>
-              {fileNameC || 'File C'}
-            </button>
+            <ExportItem
+              data={fileDataC}
+              name={fileNameC}
+              label="C"
+              badgeClass="bg-orange-600"
+              textClass="text-orange-300"
+            />
           )}
         </div>
       )}
@@ -95,6 +141,7 @@ function App() {
   const fileInputRefB = useRef(null)
   const fileInputRefC = useRef(null)
   const projectInputRef = useRef(null)
+  const a2lInputRef = useRef(null)
   const hexViewerRef = useRef(null)
   const initialized = useRef(false)
 
@@ -134,6 +181,14 @@ function App() {
   const [viewingTable, setViewingTable] = useState(null)
   const [clipboard, setClipboard] = useState(null) // { tableId, sourceFile, selection, bytes }
   const [sidebarTab, setSidebarTab] = useState('tables') // 'tables', 'diffs', 'search', 'finder', 'rev'
+  const [a2lImportSummary, setA2lImportSummary] = useState(null)
+  const [fileBaseAddress, setFileBaseAddress] = useState(0) // HEX file start address for A2L offset calculation
+
+  const loadFileData = (rawData, setData) => {
+    const { data, baseAddress } = processFileData(rawData)
+    setData(data)
+    if (baseAddress > 0) setFileBaseAddress(baseAddress)
+  }
 
   const viewModes = ['hex', 'u8', 'i8', 'u16', 'i16', 'u32', 'i32']
 
@@ -175,7 +230,7 @@ function App() {
               // Auto-load if we already have permission
               try {
                 const result = await readFromHandle(restoredA.handle)
-                setFileDataA(result.data)
+                loadFileData(result.data, setFileDataA)
               } catch (e) {
                 setNeedsPermissionA(true)
               }
@@ -191,7 +246,7 @@ function App() {
             if (restoredB.hasPermission) {
               try {
                 const result = await readFromHandle(restoredB.handle)
-                setFileDataB(result.data)
+                loadFileData(result.data, setFileDataB)
               } catch (e) {
                 setNeedsPermissionB(true)
               }
@@ -207,7 +262,7 @@ function App() {
             if (restoredC.hasPermission) {
               try {
                 const result = await readFromHandle(restoredC.handle)
-                setFileDataC(result.data)
+                loadFileData(result.data, setFileDataC)
               } catch (e) {
                 setNeedsPermissionC(true)
               }
@@ -397,12 +452,140 @@ function App() {
     })
   }, [fileDataA, fileDataB, fileDataC, compareMode])
 
+  const handleImportA2L = useCallback(async (e) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    e.target.value = ''
+
+    const fileData = fileDataA || fileDataB || fileDataC
+    if (!fileData) return
+
+    try {
+      const text = await file.text()
+      const result = parseA2LToTables(text, fileData, { baseAddress: fileBaseAddress || undefined })
+      const merged = mergeA2LTables(tables, result.tables)
+      const added = merged.length - tables.length
+      setTables(merged)
+      setSidebarTab('tables')
+      setA2lImportSummary({
+        ...result.summary,
+        added,
+        skipped: result.summary.total - added,
+        fileName: file.name,
+      })
+      setTimeout(() => setA2lImportSummary(null), 5000)
+    } catch (err) {
+      console.error('A2L parse error:', err)
+      setA2lImportSummary({ error: err.message, fileName: file.name })
+      setTimeout(() => setA2lImportSummary(null), 5000)
+    }
+  }, [fileDataA, fileDataB, fileDataC, tables, fileBaseAddress])
+
+  const [matchProgress, setMatchProgress] = useState(null)
+
+  // Compute median offset delta between File A and File B from matched tables
+  // Used by HexViewer to rebase File B addresses to File A's address space
+  const hexOffsetDeltaB = useMemo(() => {
+    const matched = tables.filter(t => t.offsetB != null)
+    if (matched.length < 3) return null
+    const deltas = matched.map(t => t.offsetB - t.offset)
+    deltas.sort((a, b) => a - b)
+    return deltas[Math.floor(deltas.length / 2)]
+  }, [tables])
+
+  const handleMatchTables = useCallback(async () => {
+    // Need tables (from A2L on file A) and a target binary (file B)
+    if (tables.length === 0 || !fileDataA || !fileDataB) return
+
+    setMatchProgress({ status: 'running', pass: '', matched: 0, total: tables.length })
+
+    // Run in next tick to let UI update
+    await new Promise(r => setTimeout(r, 50))
+
+    try {
+      // Detect size mismatch — if File A is much larger than File B,
+      // the tables likely reference a calibration area within File A.
+      // Extract that region and adjust offsets for matching.
+      let refData = fileDataA
+      let refTables = tables
+      let calAreaOffset = 0
+
+      if (fileDataA.length > fileDataB.length * 2) {
+        // Find the calibration area: the bounding region of all table offsets
+        const tableOffsets = tables.map(t => t.offset).filter(o => o >= 0)
+        const minOffset = Math.min(...tableOffsets)
+        const maxEnd = Math.max(...tables.map(t => {
+          const size = TYPE_SIZES_MAP[t.dataType] || 1
+          return t.offset + t.rows * t.cols * size
+        }))
+
+        // Align to reasonable boundary
+        calAreaOffset = Math.max(0, minOffset)
+        const calLen = Math.min(maxEnd - calAreaOffset, fileDataA.length - calAreaOffset)
+
+        if (calLen > 0 && calLen <= fileDataB.length * 2) {
+          refData = fileDataA.slice(calAreaOffset, calAreaOffset + calLen)
+          // Adjust table offsets relative to cal area start
+          refTables = tables.map(t => ({ ...t, offset: t.offset - calAreaOffset }))
+        }
+      }
+
+      const result = matchTables(refTables, refData, fileDataB, (pass, matched, total) => {
+        setMatchProgress({ status: 'running', pass, matched, total })
+      })
+
+      // Merge matched offsets into existing tables (no duplicates)
+      const matchMap = new Map()
+      for (const m of result.matches) {
+        if (m.confidence >= 0.5) {
+          matchMap.set(m.table.id, m)
+        }
+      }
+      console.log(`[matcher] result.matched=${result.matched}, matchMap.size=${matchMap.size}, tables.length=${tables.length}`)
+
+      let mergedCount = 0
+      const updatedTables = tables.map(t => {
+        const m = matchMap.get(t.id)
+        if (!m) return t
+        mergedCount++
+        return {
+          ...t,
+          offsetB: m.targetOffset,
+          _matchConfidence: m.confidence,
+          _matchMethod: m.method,
+        }
+      })
+      console.log(`[matcher] mergedCount=${mergedCount}, unmatched=${result.unmatched.length}`)
+
+      setTables(updatedTables)
+      setSidebarTab('tables')
+      setMatchProgress(null)
+      setA2lImportSummary({
+        maps: updatedTables.filter(t => t.offsetB != null && t.rows > 1 && t.cols > 1).length,
+        curves: updatedTables.filter(t => t.offsetB != null && ((t.rows === 1 && t.cols > 1) || (t.rows > 1 && t.cols === 1))).length,
+        values: updatedTables.filter(t => t.offsetB != null && t.rows === 1 && t.cols === 1).length,
+        total: mergedCount,
+        added: mergedCount,
+        skipped: 0,
+        unmatched: result.unmatched.length,
+        fileName: 'Table Matcher',
+        isMatch: true,
+      })
+      setTimeout(() => setA2lImportSummary(null), 8000)
+    } catch (err) {
+      console.error('Match error:', err)
+      setMatchProgress(null)
+      setA2lImportSummary({ error: err.message, fileName: 'Table Matcher' })
+      setTimeout(() => setA2lImportSummary(null), 5000)
+    }
+  }, [tables, fileDataA, fileDataB])
+
   const handleOpenFileA = async () => {
     if (fsApiSupported) {
       try {
         const result = await openFile()
         setFileNameA(result.name)
-        setFileDataA(result.data)
+        loadFileData(result.data, setFileDataA)
         setFileHandleA(result.handle)
         setNeedsPermissionA(false)
         await storeFileHandle('fileA', result.handle)
@@ -421,7 +604,7 @@ function App() {
       try {
         const result = await openFile()
         setFileNameB(result.name)
-        setFileDataB(result.data)
+        loadFileData(result.data, setFileDataB)
         setFileHandleB(result.handle)
         setNeedsPermissionB(false)
         await storeFileHandle('fileB', result.handle)
@@ -440,7 +623,7 @@ function App() {
       try {
         const result = await openFile()
         setFileNameC(result.name)
-        setFileDataC(result.data)
+        loadFileData(result.data, setFileDataC)
         setFileHandleC(result.handle)
         setNeedsPermissionC(false)
         await storeFileHandle('fileC', result.handle)
@@ -459,7 +642,7 @@ function App() {
     if (!fileHandleA) return
     try {
       const result = await readFromHandle(fileHandleA)
-      setFileDataA(result.data)
+      loadFileData(result.data, setFileDataA)
       setNeedsPermissionA(false)
     } catch (e) {
       console.error('Permission denied or file not accessible:', e)
@@ -470,7 +653,7 @@ function App() {
     if (!fileHandleB) return
     try {
       const result = await readFromHandle(fileHandleB)
-      setFileDataB(result.data)
+      loadFileData(result.data, setFileDataB)
       setNeedsPermissionB(false)
     } catch (e) {
       console.error('Permission denied or file not accessible:', e)
@@ -481,7 +664,7 @@ function App() {
     if (!fileHandleC) return
     try {
       const result = await readFromHandle(fileHandleC)
-      setFileDataC(result.data)
+      loadFileData(result.data, setFileDataC)
       setNeedsPermissionC(false)
     } catch (e) {
       console.error('Permission denied or file not accessible:', e)
@@ -497,7 +680,7 @@ function App() {
     const reader = new FileReader()
     reader.onload = (event) => {
       const arrayBuffer = event.target.result
-      setFileDataA(new Uint8Array(arrayBuffer))
+      loadFileData(new Uint8Array(arrayBuffer), setFileDataA)
     }
     reader.readAsArrayBuffer(file)
   }
@@ -510,7 +693,7 @@ function App() {
     const reader = new FileReader()
     reader.onload = (event) => {
       const arrayBuffer = event.target.result
-      setFileDataB(new Uint8Array(arrayBuffer))
+      loadFileData(new Uint8Array(arrayBuffer), setFileDataB)
     }
     reader.readAsArrayBuffer(file)
   }
@@ -523,26 +706,59 @@ function App() {
     const reader = new FileReader()
     reader.onload = (event) => {
       const arrayBuffer = event.target.result
-      setFileDataC(new Uint8Array(arrayBuffer))
+      loadFileData(new Uint8Array(arrayBuffer), setFileDataC)
     }
     reader.readAsArrayBuffer(file)
   }
 
-  // Download/export file
-  const handleDownloadFile = (data, fileName) => {
-    if (!data) return
+  const buildExportName = (fileName) => {
+    const baseName = (fileName || '').trim() || 'file'
+    const dotIndex = baseName.lastIndexOf('.')
+    return dotIndex > 0
+      ? `${baseName.slice(0, dotIndex)}_modified${baseName.slice(dotIndex)}`
+      : `${baseName}_modified.bin`
+  }
+
+  const downloadBlob = (data, name) => {
     const blob = new Blob([data], { type: 'application/octet-stream' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    // Add _modified suffix before extension
-    const dotIndex = fileName?.lastIndexOf('.') ?? -1
-    const newName = dotIndex > 0
-      ? fileName.slice(0, dotIndex) + '_modified' + fileName.slice(dotIndex)
-      : (fileName || 'file') + '_modified.bin'
-    a.download = newName
+    a.download = name
     a.click()
     URL.revokeObjectURL(url)
+  }
+
+  // Download/export file with default name
+  const handleDownloadFile = (data, fileName) => {
+    if (!data) return
+    const newName = buildExportName(fileName)
+    downloadBlob(data, newName)
+  }
+
+  // Save As with user-chosen filename
+  const handleSaveAsFile = async (data, fileName) => {
+    if (!data) return
+    const suggestedName = buildExportName(fileName)
+
+    if (typeof window.showSaveFilePicker === 'function') {
+      try {
+        const handle = await window.showSaveFilePicker({ suggestedName })
+        const writable = await handle.createWritable()
+        await writable.write(new Blob([data], { type: 'application/octet-stream' }))
+        await writable.close()
+        return
+      } catch (err) {
+        if (err?.name === 'AbortError') return
+        console.error('Save As failed:', err)
+        alert('Save As failed. Please try again.')
+        return
+      }
+    }
+
+    const customName = window.prompt('Save as', suggestedName)
+    if (!customName) return
+    downloadBlob(data, customName.trim() || suggestedName)
   }
 
   // Get files for diff based on diffPair
@@ -683,6 +899,7 @@ function App() {
             fileNameB={fileNameB}
             fileNameC={fileNameC}
             onDownload={handleDownloadFile}
+            onSaveAs={handleSaveAsFile}
           />
         )}
 
@@ -860,6 +1077,23 @@ function App() {
             >
               New Table
             </button>
+            <button
+              onClick={() => a2lInputRef.current?.click()}
+              className="text-gray-300 hover:bg-gray-700 px-3 py-1 rounded text-sm transition-colors"
+              title="Import A2L file to auto-create tables"
+            >
+              A2L
+            </button>
+            {tables.length > 0 && fileDataA && fileDataB && (
+              <button
+                onClick={handleMatchTables}
+                disabled={!!matchProgress}
+                className="text-gray-300 hover:bg-gray-700 px-3 py-1 rounded text-sm transition-colors disabled:opacity-50 disabled:cursor-wait"
+                title="Find matching tables in File B using File A as reference"
+              >
+                {matchProgress ? `Matching... ${matchProgress.matched}/${matchProgress.total}` : 'Match B'}
+              </button>
+            )}
           </>
         )}
 
@@ -900,13 +1134,20 @@ function App() {
         accept=".json,.webols.json"
         className="hidden"
       />
+      <input
+        type="file"
+        ref={a2lInputRef}
+        onChange={handleImportA2L}
+        accept=".a2l,.A2L"
+        className="hidden"
+      />
 
       {/* Main content area */}
       <div className="flex-1 flex overflow-hidden relative">
         {hasAnyFile ? (
           <>
             {/* Sidebar */}
-            <div className="w-56 bg-gray-850 border-r border-gray-700 flex flex-col shrink-0 bg-gray-800/50">
+            <div className="w-72 bg-gray-850 border-r border-gray-700 flex flex-col shrink-0 bg-gray-800/50">
               {/* Sidebar tabs */}
               <div className="flex border-b border-gray-700 overflow-x-auto shrink-0">
                 <button
@@ -974,23 +1215,27 @@ function App() {
               </div>
 
               {/* Tab content */}
-              <div className="flex-1 overflow-hidden flex flex-col">
+              <div className="flex-1 min-h-0 overflow-hidden flex flex-col">
                 {sidebarTab === 'tables' && (
-                  <div className="flex-1 overflow-y-auto">
-                    <TableList
-                      tables={tables}
-                      selectedId={selectedTableId}
-                      onSelect={handleSelectTable}
-                      onEdit={handleEditTable}
-                      onDelete={handleDeleteTable}
-                      onGoToOffset={(offset) => {
-                        setViewingTable(null)
-                        setSelectedTableId(null)
+                  <TableList
+                    tables={tables}
+                    selectedId={selectedTableId}
+                    onSelect={handleSelectTable}
+                    onEdit={handleEditTable}
+                    onDelete={handleDeleteTable}
+                    onGoToOffset={(offset, table) => {
+                      setViewingTable(null)
+                      setSelectedTableId(null)
+                      if (table) {
+                        const typeSize = TYPE_SIZES_MAP[table.dataType] || 1
+                        const byteLen = table.rows * table.cols * typeSize
+                        hexViewerRef.current?.highlightTable(offset, byteLen)
+                      } else {
                         hexViewerRef.current?.goToOffset(offset)
-                      }}
-                      onCopyTable={handleCopyWholeTable}
-                    />
-                  </div>
+                      }
+                    }}
+                    onCopyTable={handleCopyWholeTable}
+                  />
                 )}
 
                 {sidebarTab === 'diffs' && loadedFilesCount >= 2 && (
@@ -1199,6 +1444,7 @@ function App() {
                 heatmapEnabled={heatmapEnabled}
                 formula={formula}
                 tables={tables}
+                offsetDeltaB={hexOffsetDeltaB}
                 onSelectTable={(table) => {
                   setSelectedTableId(table.id)
                   setViewingTable(table)
@@ -1237,6 +1483,32 @@ function App() {
           </div>
         )}
       </div>
+
+      {/* A2L import toast */}
+      {a2lImportSummary && (
+        <div className={`fixed bottom-4 right-4 px-4 py-3 rounded-lg shadow-lg text-sm z-50 max-w-sm ${
+          a2lImportSummary.error ? 'bg-red-900/90 text-red-200 border border-red-700' : 'bg-green-900/90 text-green-200 border border-green-700'
+        }`}>
+          {a2lImportSummary.error ? (
+            <div>Failed to parse {a2lImportSummary.fileName}: {a2lImportSummary.error}</div>
+          ) : (
+            <div>
+              <div className="font-medium">{a2lImportSummary.isMatch ? 'Matched' : 'Imported'} {a2lImportSummary.fileName}</div>
+              <div className="text-xs mt-1 opacity-80">
+                {a2lImportSummary.added} added ({a2lImportSummary.maps} maps, {a2lImportSummary.curves} curves, {a2lImportSummary.values} values)
+                {a2lImportSummary.skipped > 0 && ` · ${a2lImportSummary.skipped} skipped`}
+                {a2lImportSummary.unmatched > 0 && ` · ${a2lImportSummary.unmatched} unmatched`}
+              </div>
+            </div>
+          )}
+          <button
+            onClick={() => setA2lImportSummary(null)}
+            className="absolute top-1 right-2 text-current opacity-50 hover:opacity-100"
+          >
+            x
+          </button>
+        </div>
+      )}
     </div>
   )
 }

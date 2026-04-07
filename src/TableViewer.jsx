@@ -34,16 +34,32 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
   // Use table's endianness if set, otherwise fall back to global prop
   const tableEndianness = table.endianness || globalEndianness
 
+  // Per-file base offset (saved in table definition)
+  const baseOffsetForFile = useCallback((file) => {
+    if (file !== 'A' && table.offsetB != null) return table.offsetB
+    return table.offset
+  }, [table])
+
+  // Track per-file live offsets independently
+  const [liveOffsetB, setLiveOffsetB] = useState(table.offsetB ?? table.offset)
+
+  // Resolve the active offset for a given file, respecting live adjustments
+  const getOffsetForFile = useCallback((file) => {
+    if (file !== 'A' && table.offsetB != null) return liveOffsetB
+    return liveOffset
+  }, [table, liveOffset, liveOffsetB])
+
   // Reset live values when table changes
   useEffect(() => {
     setLiveOffset(table.offset)
+    setLiveOffsetB(table.offsetB ?? table.offset)
     setLiveRows(table.rows)
     setLiveCols(table.cols)
     setDisplayDataType(table.dataType)
     // Clear selection when switching tables
     setSelectionStart(null)
     setSelectionEnd(null)
-  }, [table.offset, table.rows, table.cols, table.dataType, table.name])
+  }, [table.offset, table.offsetB, table.rows, table.cols, table.dataType, table.name])
 
   // Selection state
   const [selectionStart, setSelectionStart] = useState(null) // {row, col}
@@ -53,7 +69,7 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
 
   // Context menu state
   const [contextMenu, setContextMenu] = useState(null) // {x, y}
-  const [showInputModal, setShowInputModal] = useState(null) // 'absolute' | 'percent' | null
+  const [showInputModal, setShowInputModal] = useState(null) // 'set' | 'absolute' | 'percent' | null
   const [inputValue, setInputValue] = useState('')
 
   const readValue = (data, offset, size, signed, isLittleEndian) => {
@@ -100,13 +116,47 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
     return newData
   }
 
-  // Reverse formula to get raw value from display value
+  const evaluateFormula = useCallback((x) => {
+    if (!formula) return x
+    try {
+      // eslint-disable-next-line no-new-func
+      const result = new Function('x', `return ${formula}`)(x)
+      return typeof result === 'number' && !isNaN(result) ? result : null
+    } catch {
+      return null
+    }
+  }, [formula])
+
+  const clampToType = useCallback((value, size, signed) => {
+    if (!Number.isFinite(value)) return null
+    if (!signed) {
+      const maxVal = (1 << (size * 8)) - 1
+      return Math.max(0, Math.min(maxVal, value))
+    }
+    const maxVal = (1 << (size * 8 - 1)) - 1
+    const minVal = -(1 << (size * 8 - 1))
+    return Math.max(minVal, Math.min(maxVal, value))
+  }, [])
+
+  // Reverse formula to get raw value from display value (supports linear formulas)
   const reverseFormula = useCallback((displayValue) => {
     if (!formula) return displayValue
-    // Try to parse simple formulas like "x * a + b" or "x * a - b"
-    // For now, just return the value - user enters raw value
-    return displayValue
-  }, [formula])
+    const target = Number(displayValue)
+    if (!Number.isFinite(target)) return null
+
+    const f0 = evaluateFormula(0)
+    const f1 = evaluateFormula(1)
+    const f2 = evaluateFormula(2)
+    if (f0 === null || f1 === null || f2 === null) return target
+
+    const a = f1 - f0
+    const b = f0
+    const expectedF2 = a * 2 + b
+    const tolerance = Math.max(1e-6, Math.abs(expectedF2) * 1e-6)
+    if (Math.abs(f2 - expectedF2) > tolerance || a === 0) return target
+
+    return (target - b) / a
+  }, [formula, evaluateFormula])
 
   const handleCellEdit = useCallback((row, col, newValue) => {
     if (viewMode === 'diff') return // Can't edit diff view
@@ -114,24 +164,30 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
     const size = TYPE_SIZES[displayDataType]
     const signed = TYPE_SIGNED[displayDataType]
     const isLE = tableEndianness === 'little'
-    const offset = liveOffset + (row * liveCols + col) * size
+    const fileOffset = getOffsetForFile(viewMode)
+    const offset = fileOffset + (row * liveCols + col) * size
 
-    const parsedValue = parseInt(newValue, 10)
-    if (isNaN(parsedValue)) return
+    const parsedDisplay = parseFloat(newValue)
+    if (!Number.isFinite(parsedDisplay)) return
+    const rawValue = reverseFormula(parsedDisplay)
+    if (!Number.isFinite(rawValue)) return
+    const parsedValue = Math.round(rawValue)
 
     // Get the current data and file letter
     const fileMap = { A: dataA, B: dataB, C: dataC }
     const currentData = fileMap[viewMode]
     if (!currentData) return
 
-    const newData = writeValue(currentData, offset, size, signed, isLE, parsedValue)
+    const clampedValue = clampToType(parsedValue, size, signed)
+    if (clampedValue === null) return
+    const newData = writeValue(currentData, offset, size, signed, isLE, clampedValue)
     if (newData && onUpdateBinary) {
       onUpdateBinary(viewMode, newData)
     }
 
     setEditingCell(null)
     setEditValue('')
-  }, [viewMode, displayDataType, tableEndianness, liveOffset, liveCols, dataA, dataB, dataC, onUpdateBinary])
+  }, [viewMode, displayDataType, tableEndianness, liveOffset, liveCols, dataA, dataB, dataC, onUpdateBinary, getOffsetForFile])
 
   // Apply formula to value
   const applyFormula = useCallback((value) => {
@@ -139,12 +195,12 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
     try {
       const x = value
       // eslint-disable-next-line no-new-func
-      const result = new Function('x', `return ${formula}`)(x)
-      return typeof result === 'number' && !isNaN(result) ? result : value
+      const result = evaluateFormula(x)
+      return result === null ? value : result
     } catch {
       return value
     }
-  }, [formula])
+  }, [evaluateFormula])
 
   const formatDisplayValue = useCallback((value) => {
     if (value === null) return '??'
@@ -246,21 +302,29 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
     const diffDataFirst = files[firstFile]
     const diffDataSecond = files[secondFile]
 
+    // Per-file offsets for cross-tune matching
+    const offsetA = getOffsetForFile('A')
+    const offsetB = getOffsetForFile('B')
+    const offsetC = getOffsetForFile('C')
+    const fileOffsets = { A: offsetA, B: offsetB, C: offsetC }
+
     for (let r = 0; r < rows; r++) {
       const rowA = []
       const rowB = []
       const rowC = []
       const rowDiff = []
       for (let c = 0; c < cols; c++) {
-        const offset = liveOffset + (r * cols + c) * size
+        const cellIdx = (r * cols + c) * size
 
-        const valA = readValue(dataA, offset, size, signed, isLE)
-        const valB = dataB ? readValue(dataB, offset, size, signed, isLE) : null
-        const valC = dataC ? readValue(dataC, offset, size, signed, isLE) : null
+        const valA = readValue(dataA, offsetA + cellIdx, size, signed, isLE)
+        const valB = dataB ? readValue(dataB, offsetB + cellIdx, size, signed, isLE) : null
+        const valC = dataC ? readValue(dataC, offsetC + cellIdx, size, signed, isLE) : null
 
         // Compute diff based on selected pair
-        const valFirst = readValue(diffDataFirst, offset, size, signed, isLE)
-        const valSecond = readValue(diffDataSecond, offset, size, signed, isLE)
+        const offFirst = fileOffsets[firstFile]
+        const offSecond = fileOffsets[secondFile]
+        const valFirst = readValue(diffDataFirst, offFirst + cellIdx, size, signed, isLE)
+        const valSecond = readValue(diffDataSecond, offSecond + cellIdx, size, signed, isLE)
         const diff = (valFirst !== null && valSecond !== null) ? valSecond - valFirst : null
 
         rowA.push(valA)
@@ -302,7 +366,7 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
       statsC: { min: minC, max: maxC },
       statsDiff: { min: minDiff, max: maxDiff, count: diffCount, total: rows * cols }
     }
-  }, [liveOffset, effectiveDimensions, displayDataType, dataA, dataB, dataC, diffPair, tableEndianness])
+  }, [liveOffset, effectiveDimensions, displayDataType, dataA, dataB, dataC, diffPair, tableEndianness, getOffsetForFile])
 
   const getValueColor = (value, min, max) => {
     if (value === null) return 'bg-gray-800'
@@ -409,9 +473,10 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
 
     let newData = new Uint8Array(currentData)
 
+    const fileOff = getOffsetForFile(viewMode)
     for (let r = bounds.minRow; r <= bounds.maxRow; r++) {
       for (let c = bounds.minCol; c <= bounds.maxCol; c++) {
-        const offset = liveOffset + (r * liveCols + c) * size
+        const offset = fileOff + (r * liveCols + c) * size
         const oldValue = vals?.[r]?.[c]
         if (oldValue === null || oldValue === undefined) continue
 
@@ -424,15 +489,8 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
           continue
         }
 
-        // Clamp to data type range
-        if (!signed) {
-          const maxVal = (1 << (size * 8)) - 1
-          newValue = Math.max(0, Math.min(maxVal, newValue))
-        } else {
-          const maxVal = (1 << (size * 8 - 1)) - 1
-          const minVal = -(1 << (size * 8 - 1))
-          newValue = Math.max(minVal, Math.min(maxVal, newValue))
-        }
+        newValue = clampToType(newValue, size, signed)
+        if (newValue === null) continue
 
         newData = writeValue(newData, offset, size, signed, isLE, newValue) || newData
       }
@@ -440,7 +498,40 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
 
     onUpdateBinary(viewMode, newData)
     setContextMenu(null)
-  }, [isDiffMode, viewMode, dataA, dataB, dataC, displayDataType, tableEndianness, liveOffset, liveCols, getSelectionBounds, onUpdateBinary, valuesA, valuesB, valuesC])
+  }, [isDiffMode, viewMode, dataA, dataB, dataC, displayDataType, tableEndianness, liveOffset, liveCols, getSelectionBounds, onUpdateBinary, valuesA, valuesB, valuesC, clampToType, getOffsetForFile])
+
+  const applySetValue = useCallback((displayValue) => {
+    if (isDiffMode || !onUpdateBinary) return
+
+    const fileMap = { A: dataA, B: dataB, C: dataC }
+    const currentData = fileMap[viewMode]
+    if (!currentData) return
+
+    const size = TYPE_SIZES[displayDataType]
+    const signed = TYPE_SIGNED[displayDataType]
+    const isLE = tableEndianness === 'little'
+    const bounds = getSelectionBounds()
+    if (!bounds) return
+
+    const parsedDisplay = parseFloat(displayValue)
+    if (!Number.isFinite(parsedDisplay)) return
+    const rawValue = reverseFormula(parsedDisplay)
+    if (!Number.isFinite(rawValue)) return
+    const baseValue = clampToType(Math.round(rawValue), size, signed)
+    if (baseValue === null) return
+
+    const fileOff = getOffsetForFile(viewMode)
+    let newData = new Uint8Array(currentData)
+    for (let r = bounds.minRow; r <= bounds.maxRow; r++) {
+      for (let c = bounds.minCol; c <= bounds.maxCol; c++) {
+        const offset = fileOff + (r * liveCols + c) * size
+        newData = writeValue(newData, offset, size, signed, isLE, baseValue) || newData
+      }
+    }
+
+    onUpdateBinary(viewMode, newData)
+    setContextMenu(null)
+  }, [isDiffMode, onUpdateBinary, dataA, dataB, dataC, viewMode, displayDataType, tableEndianness, getSelectionBounds, liveOffset, liveCols, reverseFormula, clampToType, getOffsetForFile])
 
   // Interpolate selected cells (bilinear interpolation from corners)
   const interpolateSelection = useCallback(() => {
@@ -475,7 +566,7 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
         if ((r === bounds.minRow || r === bounds.maxRow) &&
             (c === bounds.minCol || c === bounds.maxCol)) continue
 
-        const offset = liveOffset + (r * liveCols + c) * size
+        const offset = getOffsetForFile(viewMode) + (r * liveCols + c) * size
 
         // Bilinear interpolation
         const rowRatio = rows > 1 ? (r - bounds.minRow) / (rows - 1) : 0
@@ -485,15 +576,8 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
         const bottom = bottomLeft + (bottomRight - bottomLeft) * colRatio
         let newValue = Math.round(top + (bottom - top) * rowRatio)
 
-        // Clamp to data type range
-        if (!signed) {
-          const maxVal = (1 << (size * 8)) - 1
-          newValue = Math.max(0, Math.min(maxVal, newValue))
-        } else {
-          const maxVal = (1 << (size * 8 - 1)) - 1
-          const minVal = -(1 << (size * 8 - 1))
-          newValue = Math.max(minVal, Math.min(maxVal, newValue))
-        }
+        newValue = clampToType(newValue, size, signed)
+        if (newValue === null) continue
 
         newData = writeValue(newData, offset, size, signed, isLE, newValue) || newData
       }
@@ -501,7 +585,7 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
 
     onUpdateBinary(viewMode, newData)
     setContextMenu(null)
-  }, [isDiffMode, viewMode, dataA, dataB, dataC, displayDataType, tableEndianness, liveOffset, liveCols, getSelectionBounds, onUpdateBinary, valuesA, valuesB, valuesC])
+  }, [isDiffMode, viewMode, dataA, dataB, dataC, displayDataType, tableEndianness, liveOffset, liveCols, getSelectionBounds, onUpdateBinary, valuesA, valuesB, valuesC, clampToType, getOffsetForFile])
 
   // Handle context menu
   const handleContextMenu = useCallback((e, row, col) => {
@@ -563,9 +647,10 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
       const bytes = new Uint8Array(rows * cols * size)
       let idx = 0
 
+      const fileOff = getOffsetForFile(viewMode)
       for (let r = bounds.minRow; r <= bounds.maxRow; r++) {
         for (let c = bounds.minCol; c <= bounds.maxCol; c++) {
-          const offset = liveOffset + (r * liveCols + c) * size
+          const offset = fileOff + (r * liveCols + c) * size
           for (let b = 0; b < size; b++) {
             bytes[idx++] = sourceData[offset + b] ?? 0
           }
@@ -579,13 +664,23 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
         bytes,
       })
     }
-  }, [getSelectionBounds, currentValues, formula, formatDisplayValue, onSetClipboard, isDiffMode, displayDataType, viewMode, dataA, dataB, dataC, liveOffset, liveCols, table.id])
+  }, [getSelectionBounds, currentValues, formula, formatDisplayValue, onSetClipboard, isDiffMode, displayDataType, viewMode, dataA, dataB, dataC, liveOffset, liveCols, table.id, getOffsetForFile])
 
-  const canPaste = clipboard
+  // Cross-file paste (original position)
+  const canPasteCrossFile = clipboard
     && clipboard.tableId === table.id
     && clipboard.sourceFile !== viewMode
     && !isDiffMode
     && viewMode !== 'diff'
+
+  // Same-file paste at cursor (shift within map)
+  const canPasteAtCursor = clipboard
+    && clipboard.tableId === table.id
+    && !isDiffMode
+    && viewMode !== 'diff'
+    && selectionStart != null
+
+  const canPaste = canPasteCrossFile || canPasteAtCursor
 
   const pasteSelection = useCallback(() => {
     if (!canPaste || !onUpdateBinary) return
@@ -595,13 +690,26 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
     if (!targetData) return
 
     const size = TYPE_SIZES[displayDataType]
-    const { startRow, startCol, endRow, endCol } = clipboard.selection
+    const clipRows = clipboard.selection.endRow - clipboard.selection.startRow + 1
+    const clipCols = clipboard.selection.endCol - clipboard.selection.startCol + 1
     const newData = new Uint8Array(targetData)
-    let idx = 0
 
-    for (let r = startRow; r <= endRow; r++) {
-      for (let c = startCol; c <= endCol; c++) {
-        const offset = liveOffset + (r * liveCols + c) * size
+    // Paste at current selection start if we have one, otherwise original position
+    const destRow = selectionStart ? selectionStart.row : clipboard.selection.startRow
+    const destCol = selectionStart ? selectionStart.col : clipboard.selection.startCol
+
+    let idx = 0
+    const fileOff = getOffsetForFile(viewMode)
+    for (let r = 0; r < clipRows; r++) {
+      for (let c = 0; c < clipCols; c++) {
+        const targetR = destRow + r
+        const targetC = destCol + c
+        // Bounds check
+        if (targetR >= effectiveDimensions.rows || targetC >= liveCols) {
+          idx += size
+          continue
+        }
+        const offset = fileOff + (targetR * liveCols + targetC) * size
         for (let b = 0; b < size; b++) {
           if (offset + b < newData.length) {
             newData[offset + b] = clipboard.bytes[idx]
@@ -612,7 +720,7 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
     }
 
     onUpdateBinary(viewMode, newData)
-  }, [canPaste, clipboard, viewMode, dataA, dataB, dataC, displayDataType, liveOffset, liveCols, onUpdateBinary])
+  }, [canPaste, clipboard, viewMode, dataA, dataB, dataC, displayDataType, liveOffset, liveCols, onUpdateBinary, getOffsetForFile, selectionStart, effectiveDimensions])
 
   // Keyboard handler
   const handleKeyDown = useCallback((e) => {
@@ -647,30 +755,38 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
         <div className="flex items-center gap-3">
           <span className="text-gray-200 font-semibold">{table.name}</span>
 
-          {/* Live offset controls */}
-          <div className="flex items-center gap-1 text-xs">
-            <span className="text-gray-500">@</span>
-            <button
-              onClick={() => setLiveOffset(o => Math.max(0, o - TYPE_SIZES[displayDataType]))}
-              className="px-1.5 py-0.5 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded"
-              title="Decrease offset by 1 element"
-            >−</button>
-            <input
-              type="text"
-              value={'0x' + liveOffset.toString(16).toUpperCase()}
-              onChange={(e) => {
-                const val = e.target.value.trim()
-                const num = val.startsWith('0x') ? parseInt(val.slice(2), 16) : parseInt(val, 10)
-                if (!isNaN(num) && num >= 0) setLiveOffset(num)
-              }}
-              className="w-20 bg-gray-800 border border-gray-600 rounded px-1 py-0.5 text-gray-200 font-mono text-center"
-            />
-            <button
-              onClick={() => setLiveOffset(o => o + TYPE_SIZES[displayDataType])}
-              className="px-1.5 py-0.5 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded"
-              title="Increase offset by 1 element"
-            >+</button>
-          </div>
+          {/* Live offset controls — tracks active viewMode */}
+          {(() => {
+            const isB = viewMode === 'B' || viewMode === 'C'
+            const useB = isB && table.offsetB != null
+            const activeOffset = useB ? liveOffsetB : liveOffset
+            const setActiveOffset = useB ? setLiveOffsetB : setLiveOffset
+            return (
+              <div className="flex items-center gap-1 text-xs">
+                <span className={useB ? 'text-green-500 font-medium' : 'text-gray-500'}>{useB ? viewMode + '@' : '@'}</span>
+                <button
+                  onClick={() => setActiveOffset(o => Math.max(0, o - TYPE_SIZES[displayDataType]))}
+                  className="px-1.5 py-0.5 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded"
+                  title="Decrease offset by 1 element"
+                >−</button>
+                <input
+                  type="text"
+                  value={'0x' + activeOffset.toString(16).toUpperCase()}
+                  onChange={(e) => {
+                    const val = e.target.value.trim()
+                    const num = val.startsWith('0x') ? parseInt(val.slice(2), 16) : parseInt(val, 10)
+                    if (!isNaN(num) && num >= 0) setActiveOffset(num)
+                  }}
+                  className="w-20 bg-gray-800 border border-gray-600 rounded px-1 py-0.5 text-gray-200 font-mono text-center"
+                />
+                <button
+                  onClick={() => setActiveOffset(o => o + TYPE_SIZES[displayDataType])}
+                  className="px-1.5 py-0.5 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded"
+                  title="Increase offset by 1 element"
+                >+</button>
+              </div>
+            )
+          })()}
 
           {/* Live rows/cols controls */}
           <div className="flex items-center gap-1 text-xs">
@@ -788,12 +904,96 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
               )}
             </div>
           )}
+          {/* File B offset controls */}
+          {onUpdateTable && dataA && dataB && (
+            <div className="flex items-center gap-0.5">
+              {table.offsetB != null && (
+                <>
+                  <span className="text-green-500 text-xs font-medium mr-0.5">B@</span>
+                  <button
+                    onClick={() => onUpdateTable({ ...table, offsetB: Math.max(0, table.offsetB - TYPE_SIZES[displayDataType]) })}
+                    className="px-1 py-0.5 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded text-xs leading-none"
+                  >−</button>
+                  <input
+                    type="text"
+                    value={'0x' + table.offsetB.toString(16).toUpperCase()}
+                    onChange={(e) => {
+                      const val = e.target.value.trim()
+                      const num = val.startsWith('0x') ? parseInt(val.slice(2), 16) : parseInt(val, 10)
+                      if (!isNaN(num) && num >= 0) onUpdateTable({ ...table, offsetB: num, _matchConfidence: 1, _matchMethod: 'manual' })
+                    }}
+                    className="w-[4.5rem] bg-gray-800 border border-gray-600 rounded px-1 py-0.5 text-gray-200 font-mono text-xs text-center"
+                  />
+                  <button
+                    onClick={() => onUpdateTable({ ...table, offsetB: table.offsetB + TYPE_SIZES[displayDataType] })}
+                    className="px-1 py-0.5 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded text-xs leading-none"
+                  >+</button>
+                  <button
+                    onClick={() => onUpdateTable({ ...table, offsetB: undefined, _matchConfidence: undefined, _matchMethod: undefined })}
+                    className="text-gray-600 hover:text-red-400 px-0.5 py-0.5 text-xs leading-none"
+                    title="Unlink B"
+                  >×</button>
+                </>
+              )}
+              {!table.offsetB && (
+                <button
+                  onClick={() => onUpdateTable({ ...table, offsetB: table.offset, _matchConfidence: 1, _matchMethod: 'manual' })}
+                  className="px-1.5 py-0.5 bg-green-700/60 hover:bg-green-600 text-green-300 rounded text-xs leading-none border border-green-600/30"
+                  title="Set File B offset manually"
+                >+B</button>
+              )}
+              <div className="w-px h-4 bg-gray-700 mx-0.5" />
+              <button
+                onClick={() => {
+                  const refOff = table.offset
+                  const len = table.rows * table.cols * TYPE_SIZES[displayDataType]
+                  if (refOff + len > dataA.length) return
+                  const checkLen = Math.min(len, 128)
+
+                  if (table.offsetB != null) {
+                    // Local search ±2KB around current offsetB
+                    const searchRadius = 2048
+                    let bestOff = table.offsetB, bestSim = -1
+                    const lo = Math.max(0, table.offsetB - searchRadius)
+                    const hi = Math.min(dataB.length - len, table.offsetB + searchRadius)
+                    for (let candidate = lo; candidate <= hi; candidate++) {
+                      let matches = 0
+                      for (let i = 0; i < checkLen; i++) {
+                        if (dataA[refOff + i] === dataB[candidate + i]) matches++
+                      }
+                      if (matches > bestSim) { bestSim = matches; bestOff = candidate }
+                    }
+                    const pct = Math.round(bestSim / checkLen * 100)
+                    onUpdateTable({ ...table, offsetB: bestOff, _matchConfidence: bestSim / checkLen, _matchMethod: `aligned (${pct}%)` })
+                  } else {
+                    // Full binary scan — find best match anywhere in target
+                    let bestOff = 0, bestSim = -1
+                    for (let candidate = 0; candidate <= dataB.length - len; candidate++) {
+                      let matches = 0
+                      for (let i = 0; i < checkLen; i++) {
+                        if (dataA[refOff + i] === dataB[candidate + i]) matches++
+                      }
+                      if (matches > bestSim) { bestSim = matches; bestOff = candidate }
+                    }
+                    const pct = Math.round((bestSim / checkLen) * 100)
+                    console.log(`[Find B] ${table.name}: best offset=0x${bestOff.toString(16)}, similarity=${pct}%`)
+                    onUpdateTable({ ...table, offsetB: bestOff, _matchConfidence: bestSim / checkLen, _matchMethod: `found (${pct}%)` })
+                  }
+                }}
+                className="px-1.5 py-0.5 bg-amber-600/80 hover:bg-amber-500 text-white rounded text-xs leading-none"
+                title={table.offsetB != null ? 'Auto-align ±2KB around current B offset' : 'Search entire File B for best match'}
+              >
+                {table.offsetB != null ? 'Align' : 'Find B'}
+              </button>
+            </div>
+          )}
           {/* Save button - only show if values changed */}
-          {onUpdateTable && (liveOffset !== table.offset || liveRows !== table.rows || liveCols !== table.cols || displayDataType !== table.dataType) && (
+          {onUpdateTable && (liveOffset !== table.offset || liveOffsetB !== (table.offsetB ?? table.offset) || liveRows !== table.rows || liveCols !== table.cols || displayDataType !== table.dataType) && (
             <button
               onClick={() => onUpdateTable({
                 ...table,
                 offset: liveOffset,
+                ...(table.offsetB != null ? { offsetB: liveOffsetB } : {}),
                 rows: liveRows,
                 cols: liveCols,
                 dataType: displayDataType,
@@ -932,7 +1132,10 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
                             const rawValue = viewMode === 'A' ? valuesA[rowIndex]?.[colIndex]
                               : viewMode === 'B' ? valuesB[rowIndex]?.[colIndex]
                               : valuesC[rowIndex]?.[colIndex]
-                            setEditValue(rawValue?.toString() || '0')
+                            const displayRaw = rawValue === null || rawValue === undefined
+                              ? '0'
+                              : (formula ? formatDisplayValue(rawValue) : rawValue.toString())
+                            setEditValue(displayRaw)
                           }
                         }}
                       >
@@ -1002,6 +1205,15 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
                   </svg>
                   Copy
                 </button>
+                <button
+                  onClick={() => {
+                    setShowInputModal('set')
+                    setInputValue('')
+                  }}
+                  className="bg-gray-700 hover:bg-gray-600 text-white px-2 py-0.5 rounded text-xs"
+                >
+                  Set Value
+                </button>
                 <span className="text-gray-600 text-xs">Ctrl+C</span>
               </>
             )}
@@ -1015,7 +1227,10 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
                   <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
                   </svg>
-                  Paste from {clipboard.sourceFile}
+                  {clipboard.sourceFile !== viewMode
+                    ? `Paste from ${clipboard.sourceFile}`
+                    : `Paste here (${clipboard.selection.endRow - clipboard.selection.startRow + 1}×${clipboard.selection.endCol - clipboard.selection.startCol + 1})`
+                  }
                 </button>
                 <span className="text-gray-600 text-xs">Ctrl+V</span>
               </>
@@ -1041,6 +1256,18 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
             style={{ left: contextMenu.x, top: contextMenu.y }}
             onClick={(e) => e.stopPropagation()}
           >
+            <button
+              onClick={() => {
+                setShowInputModal('set')
+                setInputValue('')
+                setContextMenu(null)
+              }}
+              className="w-full px-3 py-1.5 text-left text-sm text-gray-200 hover:bg-gray-700 flex items-center gap-2"
+            >
+              <span className="text-yellow-400">=</span>
+              Set Value
+            </button>
+            <div className="h-px bg-gray-700 my-1" />
             <button
               onClick={() => {
                 setShowInputModal('absolute')
@@ -1093,7 +1320,10 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
                 className="w-full px-3 py-1.5 text-left text-sm text-gray-200 hover:bg-gray-700 flex items-center gap-2"
               >
                 <span className="text-green-400">📋</span>
-                Paste from File {clipboard.sourceFile}
+                {clipboard.sourceFile !== viewMode
+                  ? `Paste from File ${clipboard.sourceFile}`
+                  : 'Paste here'
+                }
               </button>
             )}
           </div>
@@ -1104,25 +1334,39 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
           <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
             <div className="bg-gray-800 border border-gray-600 rounded-lg p-4 shadow-xl w-72">
               <div className="text-gray-300 text-sm font-semibold mb-3">
-                {showInputModal === 'absolute' ? 'Add/Subtract Value' : 'Change by Percent'}
+                {showInputModal === 'set'
+                  ? 'Set Value'
+                  : showInputModal === 'absolute'
+                    ? 'Add/Subtract Value'
+                    : 'Change by Percent'}
               </div>
               <div className="text-gray-500 text-xs mb-2">
-                {showInputModal === 'absolute'
-                  ? 'Enter value to add (use negative to subtract)'
-                  : 'Enter percentage change (e.g., 10 for +10%, -5 for -5%)'}
+                {showInputModal === 'set'
+                  ? `Enter value to set${formula ? ' (display units)' : ''}`
+                  : showInputModal === 'absolute'
+                    ? 'Enter value to add (use negative to subtract)'
+                    : 'Enter percentage change (e.g., 10 for +10%, -5 for -5%)'}
               </div>
               <input
                 type="number"
                 value={inputValue}
                 onChange={(e) => setInputValue(e.target.value)}
-                placeholder={showInputModal === 'absolute' ? 'e.g., 10 or -5' : 'e.g., 10 or -5'}
+                placeholder={showInputModal === 'set'
+                  ? 'e.g., 120'
+                  : showInputModal === 'absolute'
+                    ? 'e.g., 10 or -5'
+                    : 'e.g., 10 or -5'}
                 className="w-full bg-gray-900 border border-gray-600 rounded px-3 py-2 text-gray-200 text-sm outline-none focus:border-blue-500"
                 autoFocus
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') {
                     const amount = parseFloat(inputValue)
                     if (!isNaN(amount)) {
-                      applyBulkOperation(showInputModal, amount)
+                      if (showInputModal === 'set') {
+                        applySetValue(amount)
+                      } else {
+                        applyBulkOperation(showInputModal, amount)
+                      }
                     }
                     setShowInputModal(null)
                   } else if (e.key === 'Escape') {
@@ -1135,7 +1379,11 @@ function TableViewer({ table, dataA, dataB, dataC, formula: globalFormula = '', 
                   onClick={() => {
                     const amount = parseFloat(inputValue)
                     if (!isNaN(amount)) {
-                      applyBulkOperation(showInputModal, amount)
+                      if (showInputModal === 'set') {
+                        applySetValue(amount)
+                      } else {
+                        applyBulkOperation(showInputModal, amount)
+                      }
                     }
                     setShowInputModal(null)
                   }}
